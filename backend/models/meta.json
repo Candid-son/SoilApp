@@ -1,0 +1,15 @@
+{
+  "last_trained": "2026-05-12T01:00:43.481366Z",
+  "seed_samples": 200,
+  "history_samples": 2913,
+  "total_samples": 3113,
+  "is_training": false,
+  "firebase_connected": true,
+  "history_path": "sensors/history",
+  "skipped_rows": 4,
+  "accuracy": {
+    "irrigation_needed": 1.0,
+    "pest_risk": 0.9936,
+    "planting_window": 0.9807
+  }
+}
