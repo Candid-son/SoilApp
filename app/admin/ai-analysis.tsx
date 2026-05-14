@@ -2,7 +2,7 @@
  * AI Analysis Dashboard — app/admin/ai-analysis.tsx (v6)
  *
  * FIXED in v6:
- *  - BACKEND_URL updated from placeholder → https://soil-pest-api.onrender.com
+ *  - BACKEND_URL updated from placeholder → https://soilapp.onrender.com
  */
 
 import { useRouter } from "expo-router";
@@ -68,7 +68,7 @@ const LESOTHO_LAT  = -29.3167;
 const LESOTHO_LON  =  27.4833;
 
 // FIX v6: Correct Render URL (was placeholder "your-render-app")
-const BACKEND_URL  = "https://soil-pest-api.onrender.com";
+const BACKEND_URL  = "https://soilapp.onrender.com";
 
 const FETCH_TIMEOUT_MS = 10000; // increased to 10s — Render free tier can be slow to wake
 
