@@ -29,20 +29,33 @@ RETRAIN_INTERVAL_HOURS = float(os.getenv("RETRAIN_INTERVAL_HOURS", "6"))
 MIN_HISTORY_FOR_BLEND  = int(os.getenv("MIN_HISTORY_SAMPLES",      "20"))
 MODEL_DIR              = "models"
 
-AT_USERNAME = os.getenv("AT_USERNAME", "")
-AT_API_KEY  = os.getenv("AT_API_KEY",  "")
+AT_USERNAME = os.getenv("AT_USERNAME", "").strip()
+AT_API_KEY  = os.getenv("AT_API_KEY",  "").strip()
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ─── Africa's Talking initialisation ─────────────────────────────────────────
 
+if not AT_USERNAME or not AT_API_KEY:
+    print("⚠️  [SMS] WARNING: AT_USERNAME or AT_API_KEY is not set — SMS will fail.")
+elif AT_USERNAME.lower() == "sandbox":
+    print("⚠️  [SMS] WARNING: AT_USERNAME is 'sandbox' — SMS will only work in the AT simulator.")
+else:
+    print(f"✅ [SMS] Africa's Talking initialised in LIVE mode (username: {AT_USERNAME})")
+
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms_client = africastalking.SMS
 
-# In-memory stores (use Redis in production)
-otp_store:     dict = {}   # { phone: { otp, expires } }
+# In-memory cooldown store — keyed by phone number
+# Prevents the same farmer getting spammed when AI runs frequently
 last_sms_sent: dict = {}   # { phone: timestamp }
-SMS_COOLDOWN         = 120  # seconds — change to 3600 for production hourly
+SMS_COOLDOWN         = 3600  # 1 hour in seconds
+
+# Last recommendation text sent — prevents duplicate SMS for the same prediction
+last_recommendation_sent = ""
+
+# OTP store
+otp_store: dict = {}   # { phone: { otp, expires } }
 
 # ─── Feature / target definitions ─────────────────────────────────────────────
 
@@ -205,7 +218,7 @@ _state: dict = {
 
 _retrain_lock = threading.Lock()
 
-# ─── Firebase REST helper ─────────────────────────────────────────────────────
+# ─── Firebase REST helpers ────────────────────────────────────────────────────
 
 def firebase_get(path: str) -> Optional[dict]:
     url    = f"{FIREBASE_URL}/{path}.json"
@@ -222,7 +235,6 @@ def firebase_get(path: str) -> Optional[dict]:
 
 
 def firebase_set(path: str, data: dict) -> bool:
-    """Write data to a Firebase path via REST."""
     url    = f"{FIREBASE_URL}/{path}.json"
     params = {"auth": FIREBASE_AUTH_TOKEN} if FIREBASE_AUTH_TOKEN else {}
     try:
@@ -253,7 +265,6 @@ def fetch_history_df() -> pd.DataFrame:
         return pd.DataFrame()
 
     rows      = []
-    skipped   = 0
     total_raw = 0
 
     for entry in raw.values():
@@ -428,6 +439,92 @@ def _auto_retrain_loop():
         print(f"\nScheduled retrain (every {RETRAIN_INTERVAL_HOURS}h)")
         sync_and_train()
 
+# ─── AUTO SMS: fetch farmers from Firebase and send ──────────────────────────
+
+def auto_send_sms_to_farmers(recommendation: str):
+    """
+    Automatically called by /predict after every new recommendation.
+    Fetches all smsEnabled farmers from Firebase and sends them the update.
+    No app needs to be open — this runs entirely on the backend.
+    """
+    global last_recommendation_sent
+
+    # Skip if the recommendation hasn't changed since last send
+    if recommendation == last_recommendation_sent:
+        print("[SMS] Recommendation unchanged — skipping auto-send")
+        return
+
+    if not AT_USERNAME or not AT_API_KEY or AT_USERNAME.lower() == "sandbox":
+        print("[SMS] Skipping auto-send — not in live mode")
+        return
+
+    try:
+        # Fetch all users from Firebase
+        users_data = firebase_get("users")
+        if not users_data or not isinstance(users_data, dict):
+            print("[SMS] No users found in Firebase")
+            return
+
+        # Filter to SMS-enabled, phone-verified farmers
+        farmers = [
+            {"name": u.get("name", "Farmer"), "phone": u.get("phone", "")}
+            for u in users_data.values()
+            if isinstance(u, dict)
+            and u.get("role", "").lower() == "farmer"
+            and u.get("smsEnabled")        == True
+            and u.get("phoneVerified")     == True
+            and u.get("phone")
+        ]
+
+        if not farmers:
+            print("[SMS] No SMS-enabled farmers found in Firebase")
+            return
+
+        print(f"[SMS] Auto-sending to {len(farmers)} farmer(s)...")
+
+        now     = time.time()
+        sent    = 0
+        skipped = 0
+        errors  = 0
+
+        for farmer in farmers:
+            phone = clean_phone(farmer["phone"])
+            name  = farmer["name"]
+
+            # Per-farmer cooldown check
+            if now - last_sms_sent.get(phone, 0) < SMS_COOLDOWN:
+                remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(phone, 0)))
+                print(f"[SMS] Skipping {phone} — cooldown {remaining // 60}m remaining")
+                skipped += 1
+                continue
+
+            try:
+                message = (
+                    f"AGRI ALERT for {name}:\n"
+                    f"{recommendation}\n"
+                    f"— SoilApp {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+                )
+                if len(message) > 320:
+                    message = message[:317] + "..."
+
+                response = sms_client.send(message, [phone])
+                last_sms_sent[phone] = now
+                sent += 1
+                print(f"[SMS] ✅ Sent to {phone} ({name}) | Response: {response}")
+
+            except Exception as e:
+                errors += 1
+                print(f"[SMS] ❌ Failed for {phone} ({name}): {e}")
+
+        # Only update last_recommendation_sent if at least one SMS went out
+        if sent > 0:
+            last_recommendation_sent = recommendation
+
+        print(f"[SMS] Auto-send complete — sent: {sent}, skipped: {skipped}, errors: {errors}")
+
+    except Exception as e:
+        print(f"[SMS] Auto-send error: {e}")
+
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 def _startup():
@@ -453,8 +550,8 @@ _startup()
 
 app = FastAPI(
     title="SoilApp AI Backend",
-    description="Random Forest models + SMS notifications for Lesotho farmers",
-    version="6.0.0",
+    description="Random Forest models + automatic SMS notifications for Lesotho farmers",
+    version="7.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -508,8 +605,6 @@ class PestDetectResponse(BaseModel):
     matches:               List[PestMatch]
     summary:               str
 
-# ─── NEW v6 SMS Schemas ───────────────────────────────────────────────────────
-
 class OtpRequest(BaseModel):
     phone: str
 
@@ -540,16 +635,20 @@ def build_recommendation(irr: bool, pest: str, planting: str) -> str:
         return "📊 Conditions acceptable but not ideal. Wait 1–2 days for improvement."
     return "✅ All indicators are safe. No immediate action required. Monitor daily."
 
-# ─── Existing endpoints ───────────────────────────────────────────────────────
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
+    sms_mode = "not_configured"
+    if AT_USERNAME and AT_API_KEY:
+        sms_mode = "sandbox" if AT_USERNAME.lower() == "sandbox" else "live"
     return {
         "status":        "ok",
-        "version":       "6.0.0",
+        "version":       "7.0.0",
         "models_loaded": list(_state["models"].keys()),
         "is_training":   _state["meta"]["is_training"],
-        "sms_mode":      "sandbox" if AT_USERNAME == "sandbox" else "live",
+        "sms_mode":      sms_mode,
+        "at_username":   AT_USERNAME or "NOT SET",
     }
 
 
@@ -559,7 +658,7 @@ def model_status():
 
 
 @app.post("/predict", response_model=PredictionResponse)
-def predict(data: SensorInput):
+def predict(data: SensorInput, background_tasks: BackgroundTasks):
     if not _state["models"] or _state["scaler"] is None:
         raise HTTPException(status_code=503, detail="Models are still initialising. Retry shortly.")
 
@@ -586,17 +685,21 @@ def predict(data: SensorInput):
 
     recommendation = build_recommendation(bool(irr_c), pest_label, planting_label)
 
-    # ── Save recommendation to Firebase so alerts.tsx picks it up ─────────────
+    # Save recommendation to Firebase so the app picks it up in real time
     firebase_set(
         "soil_monitoring_system/aiRecommendation",
         {
-            "text":      recommendation,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "text":              recommendation,
+            "timestamp":         datetime.utcnow().isoformat() + "Z",
             "irrigation_needed": bool(irr_c),
             "pest_risk":         pest_label,
             "planting_window":   planting_label,
         }
     )
+
+    # Automatically SMS all smsEnabled farmers in the background
+    # No app needs to be open — this runs on the server
+    background_tasks.add_task(auto_send_sms_to_farmers, recommendation)
 
     return PredictionResponse(
         irrigationNeeded=bool(irr_c),
@@ -697,11 +800,14 @@ def detect_pest(data: PestDetectInput):
         summary=summary,
     )
 
-# ─── NEW v6: SMS Endpoints ────────────────────────────────────────────────────
 
 @app.post("/send-otp")
 async def send_otp(body: OtpRequest):
-    """Send a 6-digit OTP to a farmer's phone number during registration."""
+    if not AT_USERNAME or not AT_API_KEY:
+        return JSONResponse(
+            {"success": False, "error": "SMS not configured on server. Contact admin."},
+            status_code=503
+        )
     try:
         phone = clean_phone(body.phone)
         if not phone:
@@ -709,17 +815,14 @@ async def send_otp(body: OtpRequest):
 
         otp     = str(random.randint(100000, 999999))
         expires = time.time() + 600  # 10 minutes
-
         otp_store[phone] = {"otp": otp, "expires": expires}
 
-        message = (
-            f"AGRI ALERT: Your verification code is {otp}. "
+        message  = (
+            f"AGRI ALERT: Your SoilApp verification code is {otp}. "
             f"Valid for 10 minutes. Do not share this code."
         )
-
         response = sms_client.send(message, [phone])
         print(f"[OTP] Sent to {phone} | Response: {response}")
-
         return JSONResponse({"success": True, "message": f"OTP sent to {phone}"})
 
     except Exception as e:
@@ -729,7 +832,6 @@ async def send_otp(body: OtpRequest):
 
 @app.post("/verify-otp")
 async def verify_otp(body: OtpVerifyRequest):
-    """Verify the OTP entered by the farmer. Must be called before account creation."""
     try:
         phone  = clean_phone(body.phone)
         record = otp_store.get(phone)
@@ -739,14 +841,12 @@ async def verify_otp(body: OtpVerifyRequest):
                 {"success": False, "error": "No OTP found for this number. Please request a new one."},
                 status_code=400
             )
-
         if time.time() > record["expires"]:
             del otp_store[phone]
             return JSONResponse(
                 {"success": False, "error": "OTP has expired. Please request a new one."},
                 status_code=400
             )
-
         if record["otp"] != body.otp.strip():
             return JSONResponse(
                 {"success": False, "error": "Incorrect OTP. Please try again."},
@@ -764,10 +864,14 @@ async def verify_otp(body: OtpVerifyRequest):
 @app.post("/send-sms-recommendation")
 async def send_sms_recommendation(body: SmsRequest):
     """
-    Send AI recommendation SMS to a list of farmers.
-    Called by alerts.tsx whenever a new AI recommendation arrives in Firebase.
-    Enforces per-farmer cooldown to avoid SMS flooding.
+    Manual SMS endpoint — still available if needed.
+    In normal operation, SMS is sent automatically by /predict.
     """
+    if not AT_USERNAME or not AT_API_KEY:
+        return JSONResponse(
+            {"success": False, "error": "SMS credentials not configured on server."},
+            status_code=503
+        )
     if not body.farmers or not body.recommendation.strip():
         return JSONResponse(
             {"success": False, "error": "Farmers list and recommendation required"},
@@ -785,17 +889,17 @@ async def send_sms_recommendation(body: SmsRequest):
             results.append({"phone": "unknown", "status": "skipped — no phone"})
             continue
 
-        # Cooldown check
-        if now - last_sms_sent.get(phone, 0) < SMS_COOLDOWN:
-            remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(phone, 0)))
-            results.append({"phone": phone, "status": f"skipped — cooldown {remaining}s remaining"})
+        last_sent = last_sms_sent.get(phone, 0)
+        if now - last_sent < SMS_COOLDOWN:
+            remaining = int(SMS_COOLDOWN - (now - last_sent))
+            results.append({"phone": phone, "status": f"skipped — cooldown {remaining // 60}m remaining"})
             continue
 
         try:
             message = (
                 f"AGRI ALERT for {name}:\n"
                 f"{body.recommendation}\n"
-                f"Time: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+                f"— SoilApp {datetime.now().strftime('%d/%m/%Y %H:%M')}"
             )
             if len(message) > 320:
                 message = message[:317] + "..."
@@ -803,17 +907,15 @@ async def send_sms_recommendation(body: SmsRequest):
             response = sms_client.send(message, [phone])
             last_sms_sent[phone] = now
             results.append({"phone": phone, "status": "sent"})
-            print(f"[SMS] Sent to {phone} ({name}) | Response: {response}")
+            print(f"[SMS] ✅ Sent to {phone} ({name}) | Response: {response}")
 
         except Exception as e:
             results.append({"phone": phone, "status": f"error: {str(e)}"})
-            print(f"[SMS ERROR] {phone}: {e}")
+            print(f"[SMS] ❌ Failed for {phone}: {e}")
 
     sent_count    = sum(1 for r in results if r["status"] == "sent")
     skipped_count = sum(1 for r in results if "skipped" in r["status"])
-    error_count   = sum(1 for r in results if "error" in r["status"])
-
-    print(f"[SMS] Batch complete — sent: {sent_count}, skipped: {skipped_count}, errors: {error_count}")
+    error_count   = sum(1 for r in results if "error"   in r["status"])
 
     return JSONResponse({
         "success": True,
@@ -822,6 +924,7 @@ async def send_sms_recommendation(body: SmsRequest):
         "errors":  error_count,
         "results": results,
     })
+
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
