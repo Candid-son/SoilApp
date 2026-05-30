@@ -441,31 +441,45 @@ def _auto_retrain_loop():
 
 # ─── AUTO SMS: fetch farmers from Firebase and send ──────────────────────────
 
-def auto_send_sms_to_farmers(recommendation: str):
+def auto_send_sms_to_farmers(_unused_recommendation: str = ""):
     """
-    Automatically called by /predict after every new recommendation.
+    Automatically called by /predict after every prediction.
+    Reads the SMS text from soil_monitoring_system/aiRecommendation/text in Firebase
+    so the message is always in sync with what the app displays.
     Fetches all smsEnabled farmers from Firebase and sends them the update.
     No app needs to be open — this runs entirely on the backend.
     """
     global last_recommendation_sent
 
-    # Skip if the recommendation hasn't changed since last send
-    if recommendation == last_recommendation_sent:
-        print("[SMS] Recommendation unchanged — skipping auto-send")
-        return
-
     if not AT_USERNAME or not AT_API_KEY or AT_USERNAME.lower() == "sandbox":
         print("[SMS] Skipping auto-send — not in live mode")
         return
 
+    # ── Step 1: Fetch recommendation text from Firebase ──────────────────────
+    ai_rec = firebase_get("soil_monitoring_system/aiRecommendation")
+    if not ai_rec or not isinstance(ai_rec, dict):
+        print("[SMS] No aiRecommendation node found in Firebase — skipping")
+        return
+
+    recommendation = ai_rec.get("text", "").strip()
+    if not recommendation:
+        print("[SMS] aiRecommendation/text is empty — skipping")
+        return
+
+    # ── Step 2: Skip if the text hasn't changed since last send ──────────────
+    if recommendation == last_recommendation_sent:
+        print("[SMS] Recommendation unchanged — skipping auto-send")
+        return
+
+    print(f"[SMS] New recommendation from Firebase: {recommendation[:80]}...")
+
+    # ── Step 3: Fetch SMS-enabled farmers from Firebase ───────────────────────
     try:
-        # Fetch all users from Firebase
         users_data = firebase_get("users")
         if not users_data or not isinstance(users_data, dict):
             print("[SMS] No users found in Firebase")
             return
 
-        # Filter to SMS-enabled, phone-verified farmers
         farmers = [
             {"name": u.get("name", "Farmer"), "phone": u.get("phone", "")}
             for u in users_data.values()
@@ -516,7 +530,7 @@ def auto_send_sms_to_farmers(recommendation: str):
                 errors += 1
                 print(f"[SMS] ❌ Failed for {phone} ({name}): {e}")
 
-        # Only update last_recommendation_sent if at least one SMS went out
+        # Only mark recommendation as sent if at least one SMS went out
         if sent > 0:
             last_recommendation_sent = recommendation
 
@@ -551,7 +565,7 @@ _startup()
 app = FastAPI(
     title="SoilApp AI Backend",
     description="Random Forest models + automatic SMS notifications for Lesotho farmers",
-    version="7.0.0",
+    version="7.1.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -644,7 +658,7 @@ def health():
         sms_mode = "sandbox" if AT_USERNAME.lower() == "sandbox" else "live"
     return {
         "status":        "ok",
-        "version":       "7.0.0",
+        "version":       "7.1.0",
         "models_loaded": list(_state["models"].keys()),
         "is_training":   _state["meta"]["is_training"],
         "sms_mode":      sms_mode,
@@ -685,7 +699,8 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
 
     recommendation = build_recommendation(bool(irr_c), pest_label, planting_label)
 
-    # Save recommendation to Firebase so the app picks it up in real time
+    # Save recommendation to Firebase — auto_send_sms_to_farmers will read it back
+    # from here so the SMS text always matches exactly what the app displays
     firebase_set(
         "soil_monitoring_system/aiRecommendation",
         {
@@ -697,9 +712,9 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
         }
     )
 
-    # Automatically SMS all smsEnabled farmers in the background
-    # No app needs to be open — this runs on the server
-    background_tasks.add_task(auto_send_sms_to_farmers, recommendation)
+    # SMS is triggered in background; it reads the text directly from Firebase
+    # so there is no risk of the message going out of sync with what the app shows
+    background_tasks.add_task(auto_send_sms_to_farmers)
 
     return PredictionResponse(
         irrigationNeeded=bool(irr_c),
@@ -866,6 +881,8 @@ async def send_sms_recommendation(body: SmsRequest):
     """
     Manual SMS endpoint — still available if needed.
     In normal operation, SMS is sent automatically by /predict.
+    This endpoint uses the text passed in the request body,
+    NOT the Firebase aiRecommendation node.
     """
     if not AT_USERNAME or not AT_API_KEY:
         return JSONResponse(
