@@ -47,11 +47,12 @@ africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms_client = africastalking.SMS
 
 # In-memory cooldown store — keyed by phone number
+# Prevents the same farmer getting spammed when AI runs frequently
 last_sms_sent: dict = {}   # { phone: timestamp }
 SMS_COOLDOWN         = 3600  # 1 hour in seconds
 
-# Tracks the last smsText hash sent so we never duplicate the same message
-last_sms_hash_sent = ""
+# Last recommendation text sent — prevents duplicate SMS for the same prediction
+last_recommendation_sent = ""
 
 # OTP store
 otp_store: dict = {}   # { phone: { otp, expires } }
@@ -62,6 +63,7 @@ FEATURES = [
     "soil_moisture", "soil_temperature", "pest_presence",
     "air_temperature", "rainfall", "humidity", "wind_speed",
 ]
+
 TARGETS = ["irrigation_needed", "pest_risk", "planting_window"]
 
 LESOTHO_MEANS = {
@@ -437,34 +439,18 @@ def _auto_retrain_loop():
         print(f"\nScheduled retrain (every {RETRAIN_INTERVAL_HOURS}h)")
         sync_and_train()
 
-# ─── SMS: fetch farmers + send ────────────────────────────────────────────────
+# ─── AUTO SMS: fetch farmers from Firebase and send ──────────────────────────
 
-def auto_send_sms_to_farmers(sms_text: str):
+def auto_send_sms_to_farmers(recommendation: str):
     """
-    Called by /predict in the background after every new recommendation.
-
-    The app now writes a rich structured recommendation to Firebase
-    (user_data/{uid}/aiRecommendation) including a pre-formatted `smsText`
-    field. However /predict still triggers the SMS using the same
-    `sms_text` argument — the content is now the full rich SMS body
-    composed by the app rather than the short build_recommendation() string.
-
-    Flow:
-      App runs AI analysis → builds smart recommendation → writes to Firebase
-      → calls /predict → /predict calls this function with the rich smsText
-      → this function fetches all smsEnabled farmers and sends it to them.
-
-    The smsText is capped at 320 chars (2 SMS segments) to control cost.
+    Automatically called by /predict after every new recommendation.
+    Fetches all smsEnabled farmers from Firebase and sends them the update.
+    No app needs to be open — this runs entirely on the backend.
     """
-    global last_sms_hash_sent
+    global last_recommendation_sent
 
-    if not sms_text or not sms_text.strip():
-        print("[SMS] Empty smsText — skipping")
-        return
-
-    # De-duplicate: skip if this exact message was already sent recently
-    msg_hash = str(hash(sms_text.strip()))
-    if msg_hash == last_sms_hash_sent:
+    # Skip if the recommendation hasn't changed since last send
+    if recommendation == last_recommendation_sent:
         print("[SMS] Recommendation unchanged — skipping auto-send")
         return
 
@@ -473,11 +459,13 @@ def auto_send_sms_to_farmers(sms_text: str):
         return
 
     try:
+        # Fetch all users from Firebase
         users_data = firebase_get("users")
         if not users_data or not isinstance(users_data, dict):
             print("[SMS] No users found in Firebase")
             return
 
+        # Filter to SMS-enabled, phone-verified farmers
         farmers = [
             {"name": u.get("name", "Farmer"), "phone": u.get("phone", "")}
             for u in users_data.values()
@@ -492,7 +480,7 @@ def auto_send_sms_to_farmers(sms_text: str):
             print("[SMS] No SMS-enabled farmers found in Firebase")
             return
 
-        print(f"[SMS] Auto-sending rich recommendation to {len(farmers)} farmer(s)...")
+        print(f"[SMS] Auto-sending to {len(farmers)} farmer(s)...")
 
         now     = time.time()
         sent    = 0
@@ -503,7 +491,7 @@ def auto_send_sms_to_farmers(sms_text: str):
             phone = clean_phone(farmer["phone"])
             name  = farmer["name"]
 
-            # Per-farmer cooldown
+            # Per-farmer cooldown check
             if now - last_sms_sent.get(phone, 0) < SMS_COOLDOWN:
                 remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(phone, 0)))
                 print(f"[SMS] Skipping {phone} — cooldown {remaining // 60}m remaining")
@@ -511,9 +499,11 @@ def auto_send_sms_to_farmers(sms_text: str):
                 continue
 
             try:
-                # Use the full rich smsText from the app (already formatted).
-                # Truncate to 320 chars (2 SMS segments) if needed.
-                message = sms_text
+                message = (
+                    f"AGRI ALERT for {name}:\n"
+                    f"{recommendation}\n"
+                    f"— SoilApp {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+                )
                 if len(message) > 320:
                     message = message[:317] + "..."
 
@@ -526,10 +516,11 @@ def auto_send_sms_to_farmers(sms_text: str):
                 errors += 1
                 print(f"[SMS] ❌ Failed for {phone} ({name}): {e}")
 
+        # Only update last_recommendation_sent if at least one SMS went out
         if sent > 0:
-            last_sms_hash_sent = msg_hash
+            last_recommendation_sent = recommendation
 
-        print(f"[SMS] Auto-send done — sent: {sent}, skipped: {skipped}, errors: {errors}")
+        print(f"[SMS] Auto-send complete — sent: {sent}, skipped: {skipped}, errors: {errors}")
 
     except Exception as e:
         print(f"[SMS] Auto-send error: {e}")
@@ -560,7 +551,7 @@ _startup()
 app = FastAPI(
     title="SoilApp AI Backend",
     description="Random Forest models + automatic SMS notifications for Lesotho farmers",
-    version="8.0.0",
+    version="7.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -579,12 +570,6 @@ class SensorInput(BaseModel):
     rainfall:         float = Field(..., ge=0)
     humidity:         float = Field(..., ge=0,   le=100)
     wind_speed:       float = Field(..., ge=0)
-    # ── NEW: rich SMS text pre-built by the app ───────────────────────
-    # The app now sends the formatted smsText along with the sensor data.
-    # If present, the backend uses it for SMS instead of building its own
-    # short recommendation string. Falls back to build_recommendation()
-    # if the field is absent (e.g. called from a non-app client).
-    sms_text:         Optional[str] = Field(None, description="Pre-formatted SMS body from the app")
 
 class PredictionResponse(BaseModel):
     irrigationNeeded:     bool
@@ -635,7 +620,7 @@ class SmsRequest(BaseModel):
     farmers:        List[FarmerEntry]
     recommendation: str
 
-# ─── Recommendation builder (fallback if app doesn't send sms_text) ──────────
+# ─── Recommendation builder ───────────────────────────────────────────────────
 
 def build_recommendation(irr: bool, pest: str, planting: str) -> str:
     if irr:
@@ -659,7 +644,7 @@ def health():
         sms_mode = "sandbox" if AT_USERNAME.lower() == "sandbox" else "live"
     return {
         "status":        "ok",
-        "version":       "8.0.0",
+        "version":       "7.0.0",
         "models_loaded": list(_state["models"].keys()),
         "is_training":   _state["meta"]["is_training"],
         "sms_mode":      sms_mode,
@@ -698,16 +683,9 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
         _state["models"]["irrigation_needed"].feature_importances_.round(3).tolist()
     ))
 
-    # ── Build the short recommendation (shown in app UI and as fallback) ──
     recommendation = build_recommendation(bool(irr_c), pest_label, planting_label)
 
-    # ── Determine which SMS body to send ──────────────────────────────────
-    # If the app sent a pre-formatted rich smsText, use that.
-    # Otherwise fall back to the short build_recommendation() string.
-    sms_body = data.sms_text.strip() if data.sms_text and data.sms_text.strip() else recommendation
-
-    # ── Write the short recommendation to the shared Firebase path ────────
-    # (kept for backward compatibility with older app versions)
+    # Save recommendation to Firebase so the app picks it up in real time
     firebase_set(
         "soil_monitoring_system/aiRecommendation",
         {
@@ -719,9 +697,9 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
         }
     )
 
-    # ── Automatically SMS all smsEnabled farmers (background task) ────────
-    # Passes the rich SMS body so farmers receive the full structured message.
-    background_tasks.add_task(auto_send_sms_to_farmers, sms_body)
+    # Automatically SMS all smsEnabled farmers in the background
+    # No app needs to be open — this runs on the server
+    background_tasks.add_task(auto_send_sms_to_farmers, recommendation)
 
     return PredictionResponse(
         irrigationNeeded=bool(irr_c),
@@ -836,7 +814,7 @@ async def send_otp(body: OtpRequest):
             return JSONResponse({"success": False, "error": "Phone number required"}, status_code=400)
 
         otp     = str(random.randint(100000, 999999))
-        expires = time.time() + 600
+        expires = time.time() + 600  # 10 minutes
         otp_store[phone] = {"otp": otp, "expires": expires}
 
         message  = (
@@ -952,4 +930,4 @@ async def send_sms_recommendation(body: SmsRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
