@@ -52,12 +52,19 @@ else:
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms_client = africastalking.SMS
 
-last_sms_sent: dict        = {}   # { phone: timestamp }
-SMS_COOLDOWN               = 300    # 5 minutes — reduced for near-instant alerts
-last_recommendation_sent   = ""
-last_recommendation_ts     = ""    # tracks aiRecommendation/timestamp to detect changes
-AI_REC_POLL_INTERVAL       = 10    # seconds between aiRecommendation checks
-otp_store: dict            = {}   # { phone: { otp, expires } }
+# FIX: Per-alert-type SMS cooldowns instead of one global cooldown per phone.
+# Structure: { phone: { alert_type: last_sent_timestamp } }
+last_sms_sent: dict      = {}
+SMS_COOLDOWN             = 300   # 5 minutes per alert type
+
+last_recommendation_sent = ""
+last_recommendation_ts   = ""
+AI_REC_POLL_INTERVAL     = 10   # seconds
+
+# NEW: Sensor watcher interval — how often to read live sensors and run prediction
+SENSOR_POLL_INTERVAL     = 60   # seconds
+
+otp_store: dict          = {}
 
 # ─── Feature / target definitions ─────────────────────────────────────────────
 
@@ -131,7 +138,6 @@ class IdentificationResult:
     temporal_pattern: str
 
 
-# Literature-derived vibration profiles (USDA-ARS / Mankin et al.)
 VIBRATION_PROFILES: List[PestProfile] = [
     PestProfile(
         name="Phyllophaga_spp", common_name="White Grub (Scarab Beetle Larva)",
@@ -224,10 +230,10 @@ def _detect_bursts(signal: np.ndarray, fs: float,
         np.sqrt(np.mean(signal[i*window:(i+1)*window] ** 2))
         for i in range(n_win)
     ])
-    threshold    = np.median(energy) * threshold_factor
-    burst_idx    = np.where(energy > threshold)[0]
+    threshold  = np.median(energy) * threshold_factor
+    burst_idx  = np.where(energy > threshold)[0]
     duration_sec = len(signal) / fs
-    burst_rate   = len(burst_idx) / duration_sec if duration_sec > 0 else 0.0
+    burst_rate = len(burst_idx) / duration_sec if duration_sec > 0 else 0.0
     amps = [_amplitude_db(signal[i*window:(i+1)*window]) for i in burst_idx]
     mean_amp = float(np.mean(amps)) if amps else -np.inf
     return burst_idx, burst_rate, mean_amp
@@ -275,7 +281,6 @@ def _score_profile(profile: PestProfile, peak_freq, burst_rate,
                    amplitude_db, temporal_pattern, freqs, power) -> float:
     score = 0.0
 
-    # Frequency match (40 pts)
     if profile.freq_min <= peak_freq <= profile.freq_max:
         freq_score = 40.0 if profile.peak_freq_low <= peak_freq <= profile.peak_freq_high else 28.0
     else:
@@ -287,7 +292,6 @@ def _score_profile(profile: PestProfile, peak_freq, burst_rate,
     freq_score = min(40.0, freq_score * (0.5 + energy_ratio))
     score += freq_score
 
-    # Burst rate match (30 pts)
     if profile.burst_rate_min <= burst_rate <= profile.burst_rate_max:
         score += 30.0
     else:
@@ -296,7 +300,6 @@ def _score_profile(profile: PestProfile, peak_freq, burst_rate,
                  else profile.burst_rate_max / (burst_rate + 1e-9))
         score += 30.0 * max(0, min(1, ratio))
 
-    # Amplitude match (20 pts)
     if profile.amp_min <= amplitude_db <= profile.amp_max:
         score += 20.0
     else:
@@ -304,7 +307,6 @@ def _score_profile(profile: PestProfile, peak_freq, burst_rate,
                 else amplitude_db - profile.amp_max)
         score += max(0, 20.0 - diff * 1.5)
 
-    # Temporal pattern (10 pts)
     if temporal_pattern == profile.pattern:
         score += 10.0
     elif {temporal_pattern, profile.pattern} <= {"burst", "rhythmic"}:
@@ -317,11 +319,6 @@ def identify_pest_signal(raw_signal: np.ndarray,
                           sampling_rate: float = 44100.0,
                           top_n: int = 3,
                           min_duration_sec: float = 5.0) -> List[IdentificationResult]:
-    """
-    Full vibration-based pest identification pipeline.
-    Returns a ranked list of IdentificationResult (best match first).
-    Raises ValueError for signals that are too short or sampled too slowly.
-    """
     duration = len(raw_signal) / sampling_rate
     if duration < min_duration_sec:
         raise ValueError(
@@ -353,9 +350,9 @@ def identify_pest_signal(raw_signal: np.ndarray,
 
     results = []
     for rank, (profile, score) in enumerate(scored[:top_n], 1):
-        confidence = ("High"               if score >= 70
-                      else "Medium"        if score >= 45
-                      else "Low"           if score >= 25
+        confidence = ("High"          if score >= 70
+                      else "Medium"   if score >= 45
+                      else "Low"      if score >= 25
                       else "Insufficient signal")
         results.append(IdentificationResult(
             rank=rank, pest=profile, score=score, confidence=confidence,
@@ -369,7 +366,6 @@ def identify_pest_signal(raw_signal: np.ndarray,
 
 def generate_vibration_report(results: List[IdentificationResult],
                                sensor_depth_cm: float = 10.0) -> str:
-    """Format identification results into a human-readable report string."""
     if not results:
         return (
             "No significant insect vibration detected. "
@@ -625,33 +621,13 @@ def _auto_retrain_loop():
         print(f"\nScheduled retrain (every {RETRAIN_INTERVAL_HOURS}h)")
         sync_and_train()
 
-# ─── VIBRATION WATCHER — Firebase chunk reassembly + auto-analysis ───────────
-#
-# The Arduino (ESP32) uploads vibration data in chunks to Firebase:
-#   vibrationSamples/chunk_0 → {0: 0.00123, 1: 0.00456, ...}  (2000 samples)
-#   vibrationSamples/chunk_1 → ...
-#   ...
-#   vibrationSamples/chunk_49 → ...
-#   vibrationMeta/ready → true   ← set by Arduino when all chunks are uploaded
-#
-# This watcher polls for the ready flag every VIBRATION_POLL_INTERVAL seconds.
-# When it fires it:
-#   1. Reads vibrationMeta for sample_rate, chunk_size, total_chunks
-#   2. Reassembles all chunks into one flat numpy array
-#   3. Runs identify_pest_signal() on the assembled signal
-#   4. Writes results to Firebase at vibrationAnalysis/
-#   5. Clears the ready flag so the same data isn't reprocessed
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── VIBRATION WATCHER ───────────────────────────────────────────────────────
 
 VIBRATION_DEVICE_PATH   = "soil_monitoring_system/sensors/device001"
-VIBRATION_POLL_INTERVAL = 15   # seconds between ready-flag checks
+VIBRATION_POLL_INTERVAL = 15
 
 
 def _reassemble_chunks(chunks_data: dict, chunk_size: int, total_chunks: int) -> np.ndarray:
-    """
-    Rebuild the flat signal array from the chunk dict Firebase returns.
-    Each chunk key is 'chunk_N' and its value is a dict of {str(index): float}.
-    """
     signal = []
     for chunk_idx in range(total_chunks):
         key   = f"chunk_{chunk_idx}"
@@ -660,48 +636,37 @@ def _reassemble_chunks(chunks_data: dict, chunk_size: int, total_chunks: int) ->
             print(f"[VibWatch] Missing chunk_{chunk_idx} — padding with zeros")
             signal.extend([0.0] * chunk_size)
             continue
-        # Firebase returns dict keys as strings; sort numerically
         ordered = [float(chunk[str(i)]) for i in range(len(chunk)) if str(i) in chunk]
         signal.extend(ordered)
     return np.array(signal, dtype=float)
 
 
 def _process_vibration_from_firebase():
-    """
-    Called by the watcher thread when vibrationMeta/ready == true.
-    Fetches chunks, analyses the signal, writes results back to Firebase.
-    """
     device_path = VIBRATION_DEVICE_PATH
     print("[VibWatch] ready=true detected — starting analysis...")
 
-    # ── 1. Read metadata ─────────────────────────────────────────────────────
     meta = firebase_get(f"{device_path}/vibrationMeta")
     if not meta or not isinstance(meta, dict):
         print("[VibWatch] vibrationMeta missing — aborting")
         return
 
-    sample_rate   = int(meta.get("sampleRate",   10000))
-    chunk_size    = int(meta.get("chunkSize",     2000))
-    total_chunks  = int(meta.get("totalChunks",   50))
-    duration_sec  = float(meta.get("durationSec", 10.0))
-    sensor_depth  = float(firebase_get(f"{device_path}/sensorDepthCm") or 10.0)
+    sample_rate  = int(meta.get("sampleRate",   10000))
+    chunk_size   = int(meta.get("chunkSize",     2000))
+    total_chunks = int(meta.get("totalChunks",   50))
+    duration_sec = float(meta.get("durationSec", 10.0))
+    sensor_depth = float(firebase_get(f"{device_path}/sensorDepthCm") or 10.0)
 
     print(f"[VibWatch] Meta: {sample_rate}Hz × {duration_sec}s, "
           f"{total_chunks} chunks × {chunk_size} samples")
 
-    # ── 2. Clear the ready flag immediately so we don't reprocess ────────────
     firebase_set(f"{device_path}/vibrationMeta", {**meta, "ready": False})
 
-    # ── 3. Fetch all chunks ──────────────────────────────────────────────────
     chunks_data = firebase_get(f"{device_path}/vibrationSamples")
     if not chunks_data or not isinstance(chunks_data, dict):
         print("[VibWatch] No vibrationSamples found — aborting")
         _write_vibration_error("No vibration sample chunks found in Firebase.")
         return
 
-    print(f"[VibWatch] Fetched {len(chunks_data)} chunks from Firebase")
-
-    # ── 4. Reassemble flat signal ────────────────────────────────────────────
     signal = _reassemble_chunks(chunks_data, chunk_size, total_chunks)
     print(f"[VibWatch] Reassembled signal: {len(signal)} samples "
           f"({len(signal)/sample_rate:.1f}s @ {sample_rate}Hz)")
@@ -713,7 +678,6 @@ def _process_vibration_from_firebase():
         _write_vibration_error(msg)
         return
 
-    # ── 5. Run identification pipeline ──────────────────────────────────────
     try:
         results = identify_pest_signal(
             raw_signal=signal,
@@ -728,21 +692,20 @@ def _process_vibration_from_firebase():
 
     report = generate_vibration_report(results, sensor_depth_cm=sensor_depth)
 
-    # ── 6. Build Firebase payload ────────────────────────────────────────────
     matches_payload = []
     for r in results:
         matches_payload.append({
-            "rank":               r.rank,
-            "pest":               r.pest.common_name,
-            "scientificName":     r.pest.name.replace("_", " "),
-            "score":              r.score,
-            "confidence":         r.confidence,
-            "peakFreqHz":         r.peak_freq_hz,
-            "burstRatePerSec":    r.burst_rate_per_sec,
-            "amplitudeDb":        r.amplitude_db,
-            "temporalPattern":    r.temporal_pattern,
-            "damageType":         r.pest.damage_type,
-            "treatment":          r.pest.treatment,
+            "rank":            r.rank,
+            "pest":            r.pest.common_name,
+            "scientificName":  r.pest.name.replace("_", " "),
+            "score":           r.score,
+            "confidence":      r.confidence,
+            "peakFreqHz":      r.peak_freq_hz,
+            "burstRatePerSec": r.burst_rate_per_sec,
+            "amplitudeDb":     r.amplitude_db,
+            "temporalPattern": r.temporal_pattern,
+            "damageType":      r.pest.damage_type,
+            "treatment":       r.pest.treatment,
         })
 
     if not results:
@@ -771,7 +734,6 @@ def _process_vibration_from_firebase():
         "analysedAt":        datetime.utcnow().isoformat() + "Z",
     }
 
-    # ── 7. Write results to Firebase ─────────────────────────────────────────
     ok = firebase_set(f"{device_path}/vibrationAnalysis", payload)
     if ok:
         print(f"[VibWatch] ✅ Results written to Firebase | {summary[:80]}")
@@ -780,7 +742,6 @@ def _process_vibration_from_firebase():
 
 
 def _write_vibration_error(msg: str):
-    """Write an error result to Firebase so the app can display it."""
     firebase_set(
         f"{VIBRATION_DEVICE_PATH}/vibrationAnalysis",
         {
@@ -794,11 +755,6 @@ def _write_vibration_error(msg: str):
 
 
 def _vibration_watcher_loop():
-    """
-    Background thread: polls Firebase every VIBRATION_POLL_INTERVAL seconds.
-    When vibrationMeta/ready == true the Arduino has finished uploading —
-    trigger chunk reassembly and pest identification.
-    """
     print(f"[VibWatch] Watcher started — polling every {VIBRATION_POLL_INTERVAL}s")
     while True:
         try:
@@ -810,7 +766,158 @@ def _vibration_watcher_loop():
         time.sleep(VIBRATION_POLL_INTERVAL)
 
 
+# ─── NEW: SENSOR WATCHER ─────────────────────────────────────────────────────
+#
+# Polls live sensor data every SENSOR_POLL_INTERVAL seconds.
+# Validates that core fields are present and in range before running prediction.
+# Writes the result to aiRecommendation — which the AI rec watcher then picks
+# up and uses to trigger SMS to farmers automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _validate_sensor_data(data: dict) -> Optional[dict]:
+    """
+    Extract and validate sensor fields from a Firebase snapshot.
+    Returns a clean dict ready for SensorInput, or None if data is invalid.
+    """
+    # Core fields — prediction is meaningless without these
+    moisture = data.get("moisture") or data.get("soilMoisture") or data.get("soil_moisture")
+    temp     = data.get("temperature") or data.get("soilTemperature") or data.get("soil_temperature")
+
+    if moisture is None or temp is None:
+        print("[SensorWatch] Missing core fields (moisture or temperature) — skipping prediction")
+        return None
+
+    try:
+        moisture = float(moisture)
+        temp     = float(temp)
+    except (TypeError, ValueError):
+        print("[SensorWatch] Non-numeric core sensor values — skipping prediction")
+        return None
+
+    # Range validation — values outside these are sensor errors, not real readings
+    if not (0 <= moisture <= 100):
+        print(f"[SensorWatch] Moisture {moisture} out of range [0, 100] — skipping")
+        return None
+    if not (-10 <= temp <= 60):
+        print(f"[SensorWatch] Temperature {temp} out of range [-10, 60] — skipping")
+        return None
+
+    # Optional fields — fall back to Lesotho climatological means if missing
+    pest_raw    = data.get("pest_status") or data.get("pestPresence") or data.get("pest_presence") or 0
+    air_temp    = float(data.get("airTemperature") or data.get("air_temperature") or LESOTHO_MEANS["air_temperature"])
+    rainfall    = float(data.get("rainfall")   or LESOTHO_MEANS["rainfall"])
+    humidity    = float(data.get("humidity")   or LESOTHO_MEANS["humidity"])
+    wind_speed  = float(data.get("windSpeed")  or data.get("wind_speed") or LESOTHO_MEANS["wind_speed"])
+
+    return {
+        "soil_moisture":    moisture,
+        "soil_temperature": temp,
+        "pest_presence":    _parse_pest_status(pest_raw),
+        "air_temperature":  max(-10, min(50,  air_temp)),
+        "rainfall":         max(0,            rainfall),
+        "humidity":         max(0,  min(100,  humidity)),
+        "wind_speed":       max(0,            wind_speed),
+    }
+
+
+def _run_prediction_from_sensor(clean: dict) -> bool:
+    """
+    Run the Random Forest models on validated sensor data and write the
+    result to Firebase aiRecommendation. Returns True on success.
+    """
+    if not _state["models"] or _state["scaler"] is None:
+        print("[SensorWatch] Models not ready — skipping prediction")
+        return False
+
+    X  = np.array([[
+        clean["soil_moisture"],
+        clean["soil_temperature"],
+        clean["pest_presence"],
+        clean["air_temperature"],
+        clean["rainfall"],
+        clean["humidity"],
+        clean["wind_speed"],
+    ]])
+    Xs = _state["scaler"].transform(X)
+
+    irr_c  = int(_state["models"]["irrigation_needed"].predict(Xs)[0])
+    pest_c = int(_state["models"]["pest_risk"].predict(Xs)[0])
+    plan_c = int(_state["models"]["planting_window"].predict(Xs)[0])
+
+    pest_label     = PEST_MAP[pest_c]
+    planting_label = PLANTING_MAP[plan_c]
+    recommendation = build_recommendation(bool(irr_c), pest_label, planting_label, clean)
+
+    ok = firebase_set(
+        "soil_monitoring_system/aiRecommendation",
+        {
+            "text":              recommendation,
+            "timestamp":         datetime.utcnow().isoformat() + "Z",
+            "irrigation_needed": bool(irr_c),
+            "pest_risk":         pest_label,
+            "planting_window":   planting_label,
+        }
+    )
+
+    if ok:
+        print(f"[SensorWatch] ✅ aiRecommendation updated | {recommendation[:80]}")
+    else:
+        print("[SensorWatch] ❌ Failed to write aiRecommendation to Firebase")
+
+    return ok
+
+
+def _sensor_watcher_loop():
+    """
+    Background thread: reads live sensor data from Firebase every
+    SENSOR_POLL_INTERVAL seconds, validates it, and runs prediction.
+    The AI rec watcher then detects the new timestamp and fires SMS.
+    """
+    print(f"[SensorWatch] Started — polling every {SENSOR_POLL_INTERVAL}s")
+    while True:
+        try:
+            data = firebase_get(VIBRATION_DEVICE_PATH)
+            if data and isinstance(data, dict):
+                clean = _validate_sensor_data(data)
+                if clean:
+                    _run_prediction_from_sensor(clean)
+            else:
+                print("[SensorWatch] No sensor data at device path — waiting")
+        except Exception as e:
+            print(f"[SensorWatch] Error: {e}")
+        time.sleep(SENSOR_POLL_INTERVAL)
+
+
 # ─── AUTO SMS ─────────────────────────────────────────────────────────────────
+
+# FIX: SMS cooldown is now tracked per-phone per-alert-type so a pest alert
+# is never blocked by a concurrent irrigation cooldown and vice versa.
+
+def _sms_cooldown_key(phone: str, alert_type: str) -> str:
+    return f"{phone}::{alert_type}"
+
+
+def _is_sms_on_cooldown(phone: str, alert_type: str, now: float) -> bool:
+    key       = _sms_cooldown_key(phone, alert_type)
+    last_sent = last_sms_sent.get(key, 0)
+    return (now - last_sent) < SMS_COOLDOWN
+
+
+def _mark_sms_sent(phone: str, alert_type: str, now: float):
+    last_sms_sent[_sms_cooldown_key(phone, alert_type)] = now
+
+
+def _derive_alert_type(recommendation: str) -> str:
+    """Classify the recommendation text into an alert type for cooldown bucketing."""
+    rec = recommendation.lower()
+    if "irrigat" in rec:
+        return "irrigation"
+    if "pest" in rec:
+        return "pest"
+    if "plant" in rec:
+        return "planting"
+    return "general"
+
 
 def auto_send_sms_to_farmers(_unused: str = ""):
     global last_recommendation_sent
@@ -833,7 +940,8 @@ def auto_send_sms_to_farmers(_unused: str = ""):
         print("[SMS] Recommendation unchanged — skipping auto-send")
         return
 
-    print(f"[SMS] New recommendation: {recommendation[:80]}...")
+    alert_type = _derive_alert_type(recommendation)
+    print(f"[SMS] New recommendation (type: {alert_type}): {recommendation[:80]}...")
 
     try:
         users_data = firebase_get("users")
@@ -861,9 +969,11 @@ def auto_send_sms_to_farmers(_unused: str = ""):
             phone = clean_phone(farmer["phone"])
             name  = farmer["name"]
 
-            if now - last_sms_sent.get(phone, 0) < SMS_COOLDOWN:
-                remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(phone, 0)))
-                print(f"[SMS] Skipping {phone} — cooldown {remaining // 60}m remaining")
+            # FIX: check cooldown per alert type, not globally per phone
+            if _is_sms_on_cooldown(phone, alert_type, now):
+                key       = _sms_cooldown_key(phone, alert_type)
+                remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(key, 0)))
+                print(f"[SMS] Skipping {phone} ({alert_type}) — cooldown {remaining // 60}m remaining")
                 skipped += 1
                 continue
 
@@ -875,7 +985,7 @@ def auto_send_sms_to_farmers(_unused: str = ""):
                 if len(message) > 320:
                     message = message[:317] + "..."
                 response = sms_client.send(message, [phone])
-                last_sms_sent[phone] = now
+                _mark_sms_sent(phone, alert_type, now)
                 sent += 1
                 print(f"[SMS] ✅ Sent to {phone} ({name}) | {response}")
             except Exception as e:
@@ -891,12 +1001,6 @@ def auto_send_sms_to_farmers(_unused: str = ""):
         print(f"[SMS] Auto-send error: {e}")
 
 # ─── AI RECOMMENDATION WATCHER ───────────────────────────────────────────────
-#
-# Polls aiRecommendation/timestamp every AI_REC_POLL_INTERVAL seconds.
-# Fires SMS immediately whenever the timestamp changes — regardless of whether
-# /predict was the source of the update. This means any service or manual
-# update to aiRecommendation will also trigger farmer notifications.
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _ai_recommendation_watcher_loop():
     global last_recommendation_ts
@@ -909,15 +1013,11 @@ def _ai_recommendation_watcher_loop():
                 new_text = ai_rec.get("text", "").strip()
 
                 if not new_ts or not new_text or new_ts == last_recommendation_ts:
-                    pass  # nothing new — keep waiting
-
+                    pass
                 elif new_text == last_recommendation_sent:
-                    # Timestamp changed but message is identical — skip SMS
                     last_recommendation_ts = new_ts
-                    print(f"[RecWatch] Timestamp changed but text unchanged — skipping SMS")
-
+                    print("[RecWatch] Timestamp changed but text unchanged — skipping SMS")
                 else:
-                    # New timestamp AND new text — send SMS
                     print(f"[RecWatch] New recommendation (ts: {new_ts})")
                     print(f"[RecWatch] Text: {new_text[:80]}...")
                     last_recommendation_ts = new_ts
@@ -944,9 +1044,12 @@ def _startup():
     else:
         print("First run — training on seed + Firebase history...")
         sync_and_train()
-    threading.Thread(target=_auto_retrain_loop, daemon=True).start()
-    threading.Thread(target=_vibration_watcher_loop, daemon=True).start()
+
+    threading.Thread(target=_auto_retrain_loop,              daemon=True).start()
+    threading.Thread(target=_vibration_watcher_loop,         daemon=True).start()
     threading.Thread(target=_ai_recommendation_watcher_loop, daemon=True).start()
+    # NEW: start the live sensor watcher
+    threading.Thread(target=_sensor_watcher_loop,            daemon=True).start()
 
 _startup()
 
@@ -954,8 +1057,11 @@ _startup()
 
 app = FastAPI(
     title="SoilApp AI Backend",
-    description="Random Forest models + scientific vibration pest detection + Firebase vibration watcher + auto SMS for Lesotho farmers",
-    version="9.1.0",
+    description=(
+        "Random Forest models + scientific vibration pest detection + "
+        "Firebase sensor watcher + auto SMS for Lesotho farmers"
+    ),
+    version="9.2.0",
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -985,13 +1091,11 @@ class ManualReadings(BaseModel):
     readings: list[dict]
 
 class PestDetectInput(BaseModel):
-    signal:          List[float] = Field(..., description="Vibration samples in m/s² from soil sensor")
-    sampling_rate:   float       = Field(44100.0, ge=10000, le=100000,
-                                         description="Sensor sampling rate in Hz (min 10,000)")
-    sensor_depth_cm: float       = Field(10.0,    ge=0,    le=100)
-    top_n:           int         = Field(3,        ge=1,    le=8)
-    min_duration_sec: float      = Field(5.0,      ge=1.0,
-                                         description="Minimum recording length in seconds")
+    signal:           List[float] = Field(..., description="Vibration samples in m/s² from soil sensor")
+    sampling_rate:    float       = Field(44100.0, ge=10000, le=100000)
+    sensor_depth_cm:  float       = Field(10.0,    ge=0,    le=100)
+    top_n:            int         = Field(3,        ge=1,    le=8)
+    min_duration_sec: float       = Field(5.0,      ge=1.0)
 
 class PestMatchResult(BaseModel):
     rank:               int
@@ -1007,10 +1111,10 @@ class PestMatchResult(BaseModel):
     treatment:          str
 
 class PestDetectResponse(BaseModel):
-    matches:            List[PestMatchResult]
-    summary:            str
-    report:             str
-    sensor_depth_cm:    float
+    matches:             List[PestMatchResult]
+    summary:             str
+    report:              str
+    sensor_depth_cm:     float
     signal_duration_sec: float
 
 class OtpRequest(BaseModel):
@@ -1028,20 +1132,52 @@ class SmsRequest(BaseModel):
     farmers:        List[FarmerEntry]
     recommendation: str
 
-# ─── Recommendation builder ───────────────────────────────────────────────────
+# ─── FIX: build_recommendation handles combined conditions ────────────────────
+#
+# Original used if/elif so only the first matching condition was reported.
+# Now all active conditions are included in the message, prioritised by urgency.
+# ─────────────────────────────────────────────────────────────────────────────
 
-def build_recommendation(irr: bool, pest: str, planting: str) -> str:
+def build_recommendation(
+    irr: bool,
+    pest: str,
+    planting: str,
+    sensor: Optional[dict] = None,
+) -> str:
+    parts = []
+
+    # Irrigation — highest priority, always mention it
     if irr:
-        return "⚠️ Soil moisture is critically low. Irrigate within 24 hours to prevent crop stress."
+        extra = ""
+        if sensor:
+            sm = sensor.get("soil_moisture", 0)
+            st = sensor.get("soil_temperature", 0)
+            if st > 28:
+                extra = f" High temperature ({st:.0f}°C) is accelerating moisture loss."
+            elif sm < 15:
+                extra = " Moisture is critically low — crops may already be stressed."
+        parts.append(f"⚠️ Irrigate within 24 hours — soil moisture is critically low.{extra}")
+
+    # Pest — second priority
     if pest == "high":
-        return "🐛 High pest risk detected. Apply preventive treatment and inspect crops closely."
-    if pest == "medium":
-        return "🔎 Moderate pest risk. Monitor field edges — conditions favour pest activity."
-    if planting == "optimal":
-        return "🌱 Excellent conditions for maize or sorghum. Soil and Lesotho weather are ideal — plant now."
-    if planting == "suboptimal":
-        return "📊 Conditions acceptable but not ideal. Wait 1–2 days for improvement."
-    return "✅ All indicators are safe. No immediate action required. Monitor daily."
+        extra = ""
+        if sensor and sensor.get("humidity", 0) > 70:
+            extra = " High humidity is creating ideal conditions for pest spread."
+        parts.append(f"🐛 High pest risk detected.{extra} Apply preventive treatment and inspect crops closely.")
+    elif pest == "medium":
+        parts.append("🔎 Moderate pest risk. Monitor field edges — conditions favour pest activity.")
+
+    # Planting window — only surface if no urgent issues
+    if planting == "optimal" and not irr and pest != "high":
+        parts.append("🌱 Excellent conditions for maize or sorghum. Soil and weather are ideal — plant now.")
+    elif planting == "suboptimal" and not irr and pest == "low":
+        parts.append("📊 Conditions acceptable but not ideal for planting. Wait 1–2 days for improvement.")
+
+    # All clear
+    if not parts:
+        parts.append("✅ All indicators are safe. No immediate action required. Monitor daily.")
+
+    return " ".join(parts)
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -1051,15 +1187,16 @@ def health():
     if AT_USERNAME and AT_API_KEY:
         sms_mode = "sandbox" if AT_USERNAME.lower() == "sandbox" else "live"
     return {
-        "status":        "ok",
-        "version":       "9.1.0",
-        "models_loaded": list(_state["models"].keys()),
-        "is_training":   _state["meta"]["is_training"],
-        "sms_mode":      sms_mode,
-        "at_username":   AT_USERNAME or "NOT SET",
-        "pest_profiles": len(VIBRATION_PROFILES),
-        "vib_watcher":   f"polling every {VIBRATION_POLL_INTERVAL}s",
-        "rec_watcher":   f"polling every {AI_REC_POLL_INTERVAL}s",
+        "status":          "ok",
+        "version":         "9.2.0",
+        "models_loaded":   list(_state["models"].keys()),
+        "is_training":     _state["meta"]["is_training"],
+        "sms_mode":        sms_mode,
+        "at_username":     AT_USERNAME or "NOT SET",
+        "pest_profiles":   len(VIBRATION_PROFILES),
+        "vib_watcher":     f"polling every {VIBRATION_POLL_INTERVAL}s",
+        "rec_watcher":     f"polling every {AI_REC_POLL_INTERVAL}s",
+        "sensor_watcher":  f"polling every {SENSOR_POLL_INTERVAL}s",  # NEW
     }
 
 
@@ -1070,19 +1207,14 @@ def model_status():
 
 @app.get("/vibration-status")
 def vibration_status():
-    """
-    Returns the latest vibration analysis result from Firebase.
-    This is what the app should display after the Arduino finishes uploading.
-    Also shows the current ready flag so you can see if a new upload is pending.
-    """
     analysis = firebase_get(f"{VIBRATION_DEVICE_PATH}/vibrationAnalysis")
     meta      = firebase_get(f"{VIBRATION_DEVICE_PATH}/vibrationMeta")
     ready     = meta.get("ready", False) if isinstance(meta, dict) else False
     return {
-        "ready_flag":       ready,
+        "ready_flag":        ready,
         "poll_interval_sec": VIBRATION_POLL_INTERVAL,
-        "device_path":      VIBRATION_DEVICE_PATH,
-        "latest_analysis":  analysis or {"summary": "No analysis run yet."},
+        "device_path":       VIBRATION_DEVICE_PATH,
+        "latest_analysis":   analysis or {"summary": "No analysis run yet."},
     }
 
 
@@ -1108,7 +1240,10 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
     planting_label = PLANTING_MAP[plan_c]
     importance     = dict(zip(FEATURES,
                                _state["models"]["irrigation_needed"].feature_importances_.round(3).tolist()))
-    recommendation = build_recommendation(bool(irr_c), pest_label, planting_label)
+
+    # FIX: pass sensor dict so recommendation can include specific readings
+    sensor_dict    = data.model_dump()
+    recommendation = build_recommendation(bool(irr_c), pest_label, planting_label, sensor_dict)
 
     firebase_set(
         "soil_monitoring_system/aiRecommendation",
@@ -1138,15 +1273,6 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
 
 @app.post("/detect_pest", response_model=PestDetectResponse)
 def detect_pest(data: PestDetectInput):
-    """
-    Scientific vibration-based soil pest identification.
-    Uses FFT spectral analysis, burst detection, amplitude measurement,
-    and temporal pattern classification (Mankin et al., 1996-2011).
-
-    Minimum requirements:
-      - signal length ≥ min_duration_sec × sampling_rate samples
-      - sampling_rate ≥ 10,000 Hz
-    """
     signal_arr   = np.array(data.signal, dtype=float)
     duration_sec = len(signal_arr) / data.sampling_rate
 
@@ -1303,22 +1429,23 @@ async def verify_otp(body: OtpVerifyRequest):
 
 @app.post("/send-sms-recommendation")
 async def send_sms_recommendation(body: SmsRequest):
-    """Manual SMS endpoint. Uses text from request body, not Firebase."""
     if not AT_USERNAME or not AT_API_KEY:
         return JSONResponse({"success": False, "error": "SMS credentials not configured."}, status_code=503)
     if not body.farmers or not body.recommendation.strip():
         return JSONResponse({"success": False, "error": "Farmers list and recommendation required"}, status_code=400)
 
+    alert_type = _derive_alert_type(body.recommendation)
     results, now = [], time.time()
+
     for farmer in body.farmers:
         phone = clean_phone(farmer.phone)
         name  = farmer.name or "Farmer"
         if not phone:
             results.append({"phone": "unknown", "status": "skipped — no phone"})
             continue
-        last_sent = last_sms_sent.get(phone, 0)
-        if now - last_sent < SMS_COOLDOWN:
-            remaining = int(SMS_COOLDOWN - (now - last_sent))
+        if _is_sms_on_cooldown(phone, alert_type, now):
+            key       = _sms_cooldown_key(phone, alert_type)
+            remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(key, 0)))
             results.append({"phone": phone, "status": f"skipped — cooldown {remaining // 60}m remaining"})
             continue
         try:
@@ -1327,7 +1454,7 @@ async def send_sms_recommendation(body: SmsRequest):
             if len(message) > 320:
                 message = message[:317] + "..."
             response = sms_client.send(message, [phone])
-            last_sms_sent[phone] = now
+            _mark_sms_sent(phone, alert_type, now)
             results.append({"phone": phone, "status": "sent"})
             print(f"[SMS] ✅ Sent to {phone} ({name}) | {response}")
         except Exception as e:
@@ -1345,7 +1472,6 @@ async def send_sms_recommendation(body: SmsRequest):
 
 @app.get("/pest-profiles")
 def pest_profiles():
-    """List all vibration profiles used by the /detect_pest engine."""
     return [
         {
             "name":            p.common_name,
