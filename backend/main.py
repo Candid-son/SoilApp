@@ -899,7 +899,7 @@ def auto_send_sms_to_farmers(_unused: str = ""):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ai_recommendation_watcher_loop():
-    global last_recommendation_ts, last_recommendation_sent
+    global last_recommendation_ts
     print(f"[RecWatch] Watcher started — polling every {AI_REC_POLL_INTERVAL}s")
     while True:
         try:
@@ -908,15 +908,21 @@ def _ai_recommendation_watcher_loop():
                 new_ts   = ai_rec.get("timestamp", "")
                 new_text = ai_rec.get("text", "").strip()
 
-                # Fire SMS only when timestamp has changed AND text is not empty
-                if new_ts and new_text and new_ts != last_recommendation_ts:
-                    print(f"[RecWatch] New aiRecommendation detected (ts: {new_ts})")
+                if not new_ts or not new_text or new_ts == last_recommendation_ts:
+                    pass  # nothing new — keep waiting
+
+                elif new_text == last_recommendation_sent:
+                    # Timestamp changed but message is identical — skip SMS
+                    last_recommendation_ts = new_ts
+                    print(f"[RecWatch] Timestamp changed but text unchanged — skipping SMS")
+
+                else:
+                    # New timestamp AND new text — send SMS
+                    print(f"[RecWatch] New recommendation (ts: {new_ts})")
                     print(f"[RecWatch] Text: {new_text[:80]}...")
                     last_recommendation_ts = new_ts
-                    # Call SMS directly — bypass the text-change guard in
-                    # auto_send_sms_to_farmers by resetting the last sent tracker
-                    last_recommendation_sent = ""
                     auto_send_sms_to_farmers()
+
         except Exception as e:
             print(f"[RecWatch] Poll error: {e}")
         time.sleep(AI_REC_POLL_INTERVAL)
