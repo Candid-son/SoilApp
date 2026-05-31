@@ -8,3 +8,4 @@ africastalking
 joblib>=1.4.2
 pydantic>=2.0
 python-dotenv>=1.0.1
+scipy>=1.11.0
