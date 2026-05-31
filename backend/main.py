@@ -52,17 +52,14 @@ else:
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms_client = africastalking.SMS
 
-# FIX: Per-alert-type SMS cooldowns instead of one global cooldown per phone.
-# Structure: { phone: { alert_type: last_sent_timestamp } }
 last_sms_sent: dict      = {}
-SMS_COOLDOWN             = 300   # 5 minutes per alert type
+SMS_COOLDOWN             = 300
 
 last_recommendation_sent = ""
 last_recommendation_ts   = ""
-AI_REC_POLL_INTERVAL     = 10   # seconds
+AI_REC_POLL_INTERVAL     = 10
 
-# NEW: Sensor watcher interval — how often to read live sensors and run prediction
-SENSOR_POLL_INTERVAL     = 60   # seconds
+SENSOR_POLL_INTERVAL     = 60
 
 otp_store: dict          = {}
 
@@ -106,7 +103,6 @@ PLANTING_MAP     = {0: "avoid", 1: "suboptimal", 2: "optimal"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SOIL PEST VIBRATION IDENTIFICATION ENGINE
-#  Based on Mankin et al. (1996-2011) acoustic research
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -121,7 +117,7 @@ class PestProfile:
     burst_rate_max: float
     amp_min: float
     amp_max: float
-    pattern: str           # "burst" | "continuous" | "rhythmic"
+    pattern: str
     damage_type: str
     treatment: str
 
@@ -621,7 +617,7 @@ def _auto_retrain_loop():
         print(f"\nScheduled retrain (every {RETRAIN_INTERVAL_HOURS}h)")
         sync_and_train()
 
-# ─── VIBRATION WATCHER ───────────────────────────────────────────────────────
+# ─── VIBRATION WATCHER ────────────────────────────────────────────────────────
 
 VIBRATION_DEVICE_PATH   = "soil_monitoring_system/sensors/device001"
 VIBRATION_POLL_INTERVAL = 15
@@ -766,20 +762,9 @@ def _vibration_watcher_loop():
         time.sleep(VIBRATION_POLL_INTERVAL)
 
 
-# ─── NEW: SENSOR WATCHER ─────────────────────────────────────────────────────
-#
-# Polls live sensor data every SENSOR_POLL_INTERVAL seconds.
-# Validates that core fields are present and in range before running prediction.
-# Writes the result to aiRecommendation — which the AI rec watcher then picks
-# up and uses to trigger SMS to farmers automatically.
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── SENSOR WATCHER ───────────────────────────────────────────────────────────
 
 def _validate_sensor_data(data: dict) -> Optional[dict]:
-    """
-    Extract and validate sensor fields from a Firebase snapshot.
-    Returns a clean dict ready for SensorInput, or None if data is invalid.
-    """
-    # Core fields — prediction is meaningless without these
     moisture = data.get("moisture") or data.get("soilMoisture") or data.get("soil_moisture")
     temp     = data.get("temperature") or data.get("soilTemperature") or data.get("soil_temperature")
 
@@ -794,7 +779,6 @@ def _validate_sensor_data(data: dict) -> Optional[dict]:
         print("[SensorWatch] Non-numeric core sensor values — skipping prediction")
         return None
 
-    # Range validation — values outside these are sensor errors, not real readings
     if not (0 <= moisture <= 100):
         print(f"[SensorWatch] Moisture {moisture} out of range [0, 100] — skipping")
         return None
@@ -802,12 +786,11 @@ def _validate_sensor_data(data: dict) -> Optional[dict]:
         print(f"[SensorWatch] Temperature {temp} out of range [-10, 60] — skipping")
         return None
 
-    # Optional fields — fall back to Lesotho climatological means if missing
-    pest_raw    = data.get("pest_status") or data.get("pestPresence") or data.get("pest_presence") or 0
-    air_temp    = float(data.get("airTemperature") or data.get("air_temperature") or LESOTHO_MEANS["air_temperature"])
-    rainfall    = float(data.get("rainfall")   or LESOTHO_MEANS["rainfall"])
-    humidity    = float(data.get("humidity")   or LESOTHO_MEANS["humidity"])
-    wind_speed  = float(data.get("windSpeed")  or data.get("wind_speed") or LESOTHO_MEANS["wind_speed"])
+    pest_raw   = data.get("pest_status") or data.get("pestPresence") or data.get("pest_presence") or 0
+    air_temp   = float(data.get("airTemperature") or data.get("air_temperature") or LESOTHO_MEANS["air_temperature"])
+    rainfall   = float(data.get("rainfall")  or LESOTHO_MEANS["rainfall"])
+    humidity   = float(data.get("humidity")  or LESOTHO_MEANS["humidity"])
+    wind_speed = float(data.get("windSpeed") or data.get("wind_speed") or LESOTHO_MEANS["wind_speed"])
 
     return {
         "soil_moisture":    moisture,
@@ -821,10 +804,6 @@ def _validate_sensor_data(data: dict) -> Optional[dict]:
 
 
 def _run_prediction_from_sensor(clean: dict) -> bool:
-    """
-    Run the Random Forest models on validated sensor data and write the
-    result to Firebase aiRecommendation. Returns True on success.
-    """
     if not _state["models"] or _state["scaler"] is None:
         print("[SensorWatch] Models not ready — skipping prediction")
         return False
@@ -868,11 +847,6 @@ def _run_prediction_from_sensor(clean: dict) -> bool:
 
 
 def _sensor_watcher_loop():
-    """
-    Background thread: reads live sensor data from Firebase every
-    SENSOR_POLL_INTERVAL seconds, validates it, and runs prediction.
-    The AI rec watcher then detects the new timestamp and fires SMS.
-    """
     print(f"[SensorWatch] Started — polling every {SENSOR_POLL_INTERVAL}s")
     while True:
         try:
@@ -888,10 +862,89 @@ def _sensor_watcher_loop():
         time.sleep(SENSOR_POLL_INTERVAL)
 
 
-# ─── AUTO SMS ─────────────────────────────────────────────────────────────────
+# ─── HOURLY AVERAGE WATCHER ───────────────────────────────────────────────────
 
-# FIX: SMS cooldown is now tracked per-phone per-alert-type so a pest alert
-# is never blocked by a concurrent irrigation cooldown and vice versa.
+HOURLY_HISTORY_PATH = "soil_monitoring_system/hourlyHistory"
+
+_hourly_buffer: list = []   # accumulates {temperature, moisture} dicts within the current hour
+_current_hour:  int  = -1   # which UTC hour we are currently in
+
+
+def _flush_hourly_buffer(hour_label: str):
+    """Average the buffer and write one entry to Firebase hourlyHistory."""
+    global _hourly_buffer
+
+    if not _hourly_buffer:
+        print("[HourlyWatch] Buffer empty — nothing to write")
+        return
+
+    avg_temp     = round(sum(r["temperature"] for r in _hourly_buffer) / len(_hourly_buffer), 1)
+    avg_moisture = round(sum(r["moisture"]    for r in _hourly_buffer) / len(_hourly_buffer), 1)
+    sample_count = len(_hourly_buffer)
+
+    entry = {
+        "timestamp":   datetime.utcnow().isoformat() + "Z",
+        "hourLabel":   hour_label,        # e.g. "2025-06-01 14:00"
+        "temperature": avg_temp,
+        "moisture":    avg_moisture,
+        "samples":     sample_count,
+    }
+
+    # Use the hour label as the Firebase key so each hour has exactly one entry
+    safe_key = hour_label.replace(" ", "_").replace(":", "-")  # "2025-06-01_14-00"
+    ok = firebase_set(f"{HOURLY_HISTORY_PATH}/{safe_key}", entry)
+
+    if ok:
+        print(f"[HourlyWatch] ✅ {hour_label} | temp={avg_temp}°C "
+              f"moisture={avg_moisture}% ({sample_count} samples)")
+    else:
+        print(f"[HourlyWatch] ❌ Failed to write entry for {hour_label}")
+
+    _hourly_buffer = []
+
+
+def _hourly_average_loop():
+    """
+    Runs every 60s. Reads live sensor data into a buffer.
+    When the clock hour changes, flushes the buffer as a single
+    averaged entry to soil_monitoring_system/hourlyHistory.
+    """
+    global _current_hour
+
+    print("[HourlyWatch] Started — sampling every 60s, flushing at each new hour")
+
+    while True:
+        try:
+            data = firebase_get(VIBRATION_DEVICE_PATH)
+            if data and isinstance(data, dict):
+                clean = _validate_sensor_data(data)
+                if clean:
+                    _hourly_buffer.append({
+                        "temperature": clean["soil_temperature"],
+                        "moisture":    clean["soil_moisture"],
+                    })
+
+                    now  = datetime.utcnow()
+                    hour = now.hour
+
+                    if _current_hour == -1:
+                        # First sample — just record the hour, don't flush yet
+                        _current_hour = hour
+                    elif hour != _current_hour:
+                        # Hour rolled over — flush what we collected
+                        hour_label = (
+                            now.strftime("%Y-%m-%d") + f" {_current_hour:02d}:00"
+                        )
+                        _flush_hourly_buffer(hour_label)
+                        _current_hour = hour
+
+        except Exception as e:
+            print(f"[HourlyWatch] Error: {e}")
+
+        time.sleep(60)
+
+
+# ─── AUTO SMS ─────────────────────────────────────────────────────────────────
 
 def _sms_cooldown_key(phone: str, alert_type: str) -> str:
     return f"{phone}::{alert_type}"
@@ -908,7 +961,6 @@ def _mark_sms_sent(phone: str, alert_type: str, now: float):
 
 
 def _derive_alert_type(recommendation: str) -> str:
-    """Classify the recommendation text into an alert type for cooldown bucketing."""
     rec = recommendation.lower()
     if "irrigat" in rec:
         return "irrigation"
@@ -969,7 +1021,6 @@ def auto_send_sms_to_farmers(_unused: str = ""):
             phone = clean_phone(farmer["phone"])
             name  = farmer["name"]
 
-            # FIX: check cooldown per alert type, not globally per phone
             if _is_sms_on_cooldown(phone, alert_type, now):
                 key       = _sms_cooldown_key(phone, alert_type)
                 remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(key, 0)))
@@ -1048,8 +1099,8 @@ def _startup():
     threading.Thread(target=_auto_retrain_loop,              daemon=True).start()
     threading.Thread(target=_vibration_watcher_loop,         daemon=True).start()
     threading.Thread(target=_ai_recommendation_watcher_loop, daemon=True).start()
-    # NEW: start the live sensor watcher
     threading.Thread(target=_sensor_watcher_loop,            daemon=True).start()
+    threading.Thread(target=_hourly_average_loop,            daemon=True).start()
 
 _startup()
 
@@ -1059,9 +1110,9 @@ app = FastAPI(
     title="SoilApp AI Backend",
     description=(
         "Random Forest models + scientific vibration pest detection + "
-        "Firebase sensor watcher + auto SMS for Lesotho farmers"
+        "Firebase sensor watcher + hourly history + auto SMS for Lesotho farmers"
     ),
-    version="9.2.0",
+    version="9.3.0",
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -1132,11 +1183,7 @@ class SmsRequest(BaseModel):
     farmers:        List[FarmerEntry]
     recommendation: str
 
-# ─── FIX: build_recommendation handles combined conditions ────────────────────
-#
-# Original used if/elif so only the first matching condition was reported.
-# Now all active conditions are included in the message, prioritised by urgency.
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── build_recommendation ─────────────────────────────────────────────────────
 
 def build_recommendation(
     irr: bool,
@@ -1146,7 +1193,6 @@ def build_recommendation(
 ) -> str:
     parts = []
 
-    # Irrigation — highest priority, always mention it
     if irr:
         extra = ""
         if sensor:
@@ -1158,7 +1204,6 @@ def build_recommendation(
                 extra = " Moisture is critically low — crops may already be stressed."
         parts.append(f"⚠️ Irrigate within 24 hours — soil moisture is critically low.{extra}")
 
-    # Pest — second priority
     if pest == "high":
         extra = ""
         if sensor and sensor.get("humidity", 0) > 70:
@@ -1167,13 +1212,11 @@ def build_recommendation(
     elif pest == "medium":
         parts.append("🔎 Moderate pest risk. Monitor field edges — conditions favour pest activity.")
 
-    # Planting window — only surface if no urgent issues
     if planting == "optimal" and not irr and pest != "high":
         parts.append("🌱 Excellent conditions for maize or sorghum. Soil and weather are ideal — plant now.")
     elif planting == "suboptimal" and not irr and pest == "low":
         parts.append("📊 Conditions acceptable but not ideal for planting. Wait 1–2 days for improvement.")
 
-    # All clear
     if not parts:
         parts.append("✅ All indicators are safe. No immediate action required. Monitor daily.")
 
@@ -1188,7 +1231,7 @@ def health():
         sms_mode = "sandbox" if AT_USERNAME.lower() == "sandbox" else "live"
     return {
         "status":          "ok",
-        "version":         "9.2.0",
+        "version":         "9.3.0",
         "models_loaded":   list(_state["models"].keys()),
         "is_training":     _state["meta"]["is_training"],
         "sms_mode":        sms_mode,
@@ -1196,7 +1239,8 @@ def health():
         "pest_profiles":   len(VIBRATION_PROFILES),
         "vib_watcher":     f"polling every {VIBRATION_POLL_INTERVAL}s",
         "rec_watcher":     f"polling every {AI_REC_POLL_INTERVAL}s",
-        "sensor_watcher":  f"polling every {SENSOR_POLL_INTERVAL}s",  # NEW
+        "sensor_watcher":  f"polling every {SENSOR_POLL_INTERVAL}s",
+        "hourly_watcher":  f"sampling every 60s, flushing hourly",
     }
 
 
@@ -1241,7 +1285,6 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
     importance     = dict(zip(FEATURES,
                                _state["models"]["irrigation_needed"].feature_importances_.round(3).tolist()))
 
-    # FIX: pass sensor dict so recommendation can include specific readings
     sensor_dict    = data.model_dump()
     recommendation = build_recommendation(bool(irr_c), pest_label, planting_label, sensor_dict)
 
