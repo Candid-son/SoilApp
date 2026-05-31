@@ -3,6 +3,8 @@ import os
 import random
 import threading
 import time
+import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Literal, Optional
 
@@ -11,14 +13,18 @@ import joblib
 import numpy as np
 import pandas as pd
 import requests
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from scipy.fft import fft, fftfreq
+from scipy.signal import butter, filtfilt, find_peaks
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -46,16 +52,12 @@ else:
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms_client = africastalking.SMS
 
-# In-memory cooldown store — keyed by phone number
-# Prevents the same farmer getting spammed when AI runs frequently
-last_sms_sent: dict = {}   # { phone: timestamp }
-SMS_COOLDOWN         = 3600  # 1 hour in seconds
-
-# Last recommendation text sent — prevents duplicate SMS for the same prediction
-last_recommendation_sent = ""
-
-# OTP store
-otp_store: dict = {}   # { phone: { otp, expires } }
+last_sms_sent: dict        = {}   # { phone: timestamp }
+SMS_COOLDOWN               = 300    # 5 minutes — reduced for near-instant alerts
+last_recommendation_sent   = ""
+last_recommendation_ts     = ""    # tracks aiRecommendation/timestamp to detect changes
+AI_REC_POLL_INTERVAL       = 10    # seconds between aiRecommendation checks
+otp_store: dict            = {}   # { phone: { otp, expires } }
 
 # ─── Feature / target definitions ─────────────────────────────────────────────
 
@@ -91,62 +93,310 @@ FIELD_ALIASES = {
     "pest_presence":    "pest_presence",
 }
 
-NO_PEST_PHRASES = {"no pest", "clear", "none", "normal", "no pest detected", "no pest activity"}
+NO_PEST_PHRASES  = {"no pest", "clear", "none", "normal", "no pest detected", "no pest activity"}
+PEST_MAP         = {0: "low",   1: "medium",     2: "high"}
+PLANTING_MAP     = {0: "avoid", 1: "suboptimal", 2: "optimal"}
 
-PEST_MAP     = {0: "low",   1: "medium",     2: "high"}
-PLANTING_MAP = {0: "avoid", 1: "suboptimal", 2: "optimal"}
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SOIL PEST VIBRATION IDENTIFICATION ENGINE
+#  Based on Mankin et al. (1996-2011) acoustic research
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── Pest species database ────────────────────────────────────────────────────
+@dataclass
+class PestProfile:
+    name: str
+    common_name: str
+    freq_min: float
+    freq_max: float
+    peak_freq_low: float
+    peak_freq_high: float
+    burst_rate_min: float
+    burst_rate_max: float
+    amp_min: float
+    amp_max: float
+    pattern: str           # "burst" | "continuous" | "rhythmic"
+    damage_type: str
+    treatment: str
 
-PEST_PROFILES = [
-    {
-        "pest":      "African Armyworm (Spodoptera exempta)",
-        "freq_lo":   80,  "freq_hi": 250,
-        "damage":    "Destroys maize and sorghum leaves overnight. Can strip an entire field in days.",
-        "treatment": "Apply lambda-cyhalothrin or emamectin benzoate at dusk when larvae are active.",
-    },
-    {
-        "pest":      "Termites (Macrotermes spp.)",
-        "freq_lo":   20,  "freq_hi": 100,
-        "damage":    "Attacks roots and stems of maize, sorghum, and wheat. Causes sudden wilting.",
-        "treatment": "Apply chlorpyrifos drench around stem base. Remove crop residues after harvest.",
-    },
-    {
-        "pest":      "Mole Cricket (Gryllotalpa africana)",
-        "freq_lo":   150, "freq_hi": 400,
-        "damage":    "Tunnels through soil, severing roots and seedlings. Most damaging in sandy soils.",
-        "treatment": "Bait with carbaryl-treated bran at night. Flood tunnels with soapy water.",
-    },
-    {
-        "pest":      "White Grub / Scarab Beetle Larva",
-        "freq_lo":   50,  "freq_hi": 180,
-        "damage":    "Feeds on roots of maize, potatoes, and pasture grasses. Causes patchy die-off.",
-        "treatment": "Apply imidacloprid granules at planting. Rotate crops annually.",
-    },
-    {
-        "pest":      "Cutworm (Agrotis spp.)",
-        "freq_lo":   100, "freq_hi": 300,
-        "damage":    "Cuts seedlings at soil level. Most active in cool, moist soils at night.",
-        "treatment": "Apply chlorpyrifos or spinosad bait in furrows. Cultivate to expose pupae.",
-    },
-    {
-        "pest":      "Root-Knot Nematode (Meloidogyne spp.)",
-        "freq_lo":   10,  "freq_hi": 60,
-        "damage":    "Causes galls on roots of vegetables and legumes, reducing water and nutrient uptake.",
-        "treatment": "Solarise soil, apply carbofuran, or rotate with resistant varieties.",
-    },
-    {
-        "pest":      "Wireworm (Agriotes spp.)",
-        "freq_lo":   40,  "freq_hi": 130,
-        "damage":    "Bores into potato tubers, maize kernels, and cereal seeds. Hard to detect early.",
-        "treatment": "Seed treatment with thiamethoxam. Avoid planting in fields with grass history.",
-    },
+
+@dataclass
+class IdentificationResult:
+    rank: int
+    pest: PestProfile
+    score: float
+    confidence: str
+    peak_freq_hz: float
+    burst_rate_per_sec: float
+    amplitude_db: float
+    temporal_pattern: str
+
+
+# Literature-derived vibration profiles (USDA-ARS / Mankin et al.)
+VIBRATION_PROFILES: List[PestProfile] = [
+    PestProfile(
+        name="Phyllophaga_spp", common_name="White Grub (Scarab Beetle Larva)",
+        freq_min=200, freq_max=800, peak_freq_low=300, peak_freq_high=600,
+        burst_rate_min=0.1, burst_rate_max=1.0, amp_min=20, amp_max=45,
+        pattern="burst",
+        damage_type="Root feeding – chews through grass and crop roots",
+        treatment="Beneficial nematodes (Heterorhabditis bacteriophora), imidacloprid drench",
+    ),
+    PestProfile(
+        name="Scapteriscus_spp", common_name="Mole Cricket",
+        freq_min=300, freq_max=1500, peak_freq_low=500, peak_freq_high=1000,
+        burst_rate_min=5.0, burst_rate_max=20.0, amp_min=35, amp_max=60,
+        pattern="continuous",
+        damage_type="Tunnelling destroys root systems and uproots seedlings",
+        treatment="Steinernema scapterisci nematodes, bifenthrin baits",
+    ),
+    PestProfile(
+        name="Agriotes_spp", common_name="Wireworm (Click Beetle Larva)",
+        freq_min=500, freq_max=1500, peak_freq_low=700, peak_freq_high=1200,
+        burst_rate_min=0.05, burst_rate_max=0.5, amp_min=15, amp_max=35,
+        pattern="burst",
+        damage_type="Tunnels through seeds, roots, and underground stems",
+        treatment="Steinernema carpocapsae nematodes, spinosad soil drench",
+    ),
+    PestProfile(
+        name="Agrotis_spp", common_name="Cutworm (Noctuid Moth Larva)",
+        freq_min=100, freq_max=600, peak_freq_low=150, peak_freq_high=400,
+        burst_rate_min=0.1, burst_rate_max=0.5, amp_min=18, amp_max=38,
+        pattern="burst",
+        damage_type="Severs seedling stems at soil level; surface nocturnal feeder",
+        treatment="Bacillus thuringiensis (Bt), Steinernema carpocapsae nematodes",
+    ),
+    PestProfile(
+        name="Diaprepes_Otiorhynchus", common_name="Root Weevil Larva",
+        freq_min=400, freq_max=1200, peak_freq_low=500, peak_freq_high=900,
+        burst_rate_min=0.2, burst_rate_max=2.0, amp_min=25, amp_max=50,
+        pattern="burst",
+        damage_type="Girdling of roots; kills citrus and ornamental plants",
+        treatment="Heterorhabditis bacteriophora nematodes, entomopathogenic fungi",
+    ),
+    PestProfile(
+        name="Reticulitermes_spp", common_name="Subterranean Termite",
+        freq_min=50, freq_max=500, peak_freq_low=100, peak_freq_high=300,
+        burst_rate_min=1.0, burst_rate_max=10.0, amp_min=30, amp_max=55,
+        pattern="rhythmic",
+        damage_type="Destroys woody plant roots and below-ground stems",
+        treatment="Fipronil soil barrier, beneficial nematodes, borate baits",
+    ),
+    PestProfile(
+        name="Diabrotica_spp", common_name="Corn Rootworm (Chrysomelid Larva)",
+        freq_min=300, freq_max=900, peak_freq_low=400, peak_freq_high=700,
+        burst_rate_min=0.1, burst_rate_max=1.0, amp_min=20, amp_max=42,
+        pattern="burst",
+        damage_type="Prunes corn root system, causing lodging and yield loss",
+        treatment="Crop rotation, Bt CrylF/Cry3 traits, soil-applied insecticides",
+    ),
+    PestProfile(
+        name="Bradysia_spp", common_name="Fungus Gnat Larva",
+        freq_min=50, freq_max=300, peak_freq_low=80, peak_freq_high=200,
+        burst_rate_min=0.05, burst_rate_max=0.3, amp_min=10, amp_max=25,
+        pattern="burst",
+        damage_type="Feeds on roots and organic matter; damages seedlings",
+        treatment="Steinernema feltiae nematodes, hydrogen peroxide drench",
+    ),
 ]
+
+# ─── Signal processing helpers ────────────────────────────────────────────────
+
+def _bandpass_filter(signal: np.ndarray, fs: float,
+                     lowcut: float = 50.0, highcut: float = 5000.0) -> np.ndarray:
+    nyq  = 0.5 * fs
+    low  = lowcut / nyq
+    high = min(highcut / nyq, 0.99)
+    b, a = butter(4, [low, high], btype="band")
+    return filtfilt(b, a, signal)
+
+
+def _amplitude_db(signal: np.ndarray, ref: float = 1e-6) -> float:
+    rms = np.sqrt(np.mean(signal ** 2))
+    return 20 * np.log10(rms / ref) if rms > 0 else -np.inf
+
+
+def _detect_bursts(signal: np.ndarray, fs: float,
+                   window_ms: float = 50.0,
+                   threshold_factor: float = 3.0):
+    window   = max(1, int((window_ms / 1000.0) * fs))
+    n_win    = len(signal) // window
+    energy   = np.array([
+        np.sqrt(np.mean(signal[i*window:(i+1)*window] ** 2))
+        for i in range(n_win)
+    ])
+    threshold    = np.median(energy) * threshold_factor
+    burst_idx    = np.where(energy > threshold)[0]
+    duration_sec = len(signal) / fs
+    burst_rate   = len(burst_idx) / duration_sec if duration_sec > 0 else 0.0
+    amps = [_amplitude_db(signal[i*window:(i+1)*window]) for i in burst_idx]
+    mean_amp = float(np.mean(amps)) if amps else -np.inf
+    return burst_idx, burst_rate, mean_amp
+
+
+def _compute_spectrum(signal: np.ndarray, fs: float, n_fft: int = 4096):
+    padded   = np.zeros(n_fft)
+    length   = min(len(signal), n_fft)
+    padded[:length] = signal[:length]
+    windowed = padded * np.hanning(n_fft)
+    spectrum = np.abs(fft(windowed))
+    freqs    = fftfreq(n_fft, d=1.0 / fs)
+    pos      = freqs > 0
+    freqs, power = freqs[pos], spectrum[pos] ** 2
+    if len(power) > 0:
+        peaks, _ = find_peaks(power, height=np.max(power) * 0.1)
+        dom_freq = float(freqs[peaks[np.argmax(power[peaks])]] if len(peaks) > 0
+                         else freqs[np.argmax(power)])
+    else:
+        dom_freq = 0.0
+    return freqs, power, dom_freq
+
+
+def _band_energy(freqs, power, lo, hi):
+    return float(np.sum(power[(freqs >= lo) & (freqs <= hi)]))
+
+
+def _classify_pattern(burst_idx: np.ndarray, burst_rate: float) -> str:
+    if burst_rate > 4.0:
+        return "continuous"
+    if len(burst_idx) < 4:
+        return "burst"
+    ibi = np.diff(burst_idx).astype(float)
+    cv  = np.std(ibi) / (np.mean(ibi) + 1e-9)
+    return "rhythmic" if cv < 0.3 else "burst"
+
+
+def _is_background_noise(freqs, power, amplitude_db: float) -> bool:
+    lo  = _band_energy(freqs, power, 50, 400)
+    hi  = _band_energy(freqs, power, 400, 5000) + 1e-12
+    return (lo / hi) > 3.0 and amplitude_db > 65.0
+
+
+def _score_profile(profile: PestProfile, peak_freq, burst_rate,
+                   amplitude_db, temporal_pattern, freqs, power) -> float:
+    score = 0.0
+
+    # Frequency match (40 pts)
+    if profile.freq_min <= peak_freq <= profile.freq_max:
+        freq_score = 40.0 if profile.peak_freq_low <= peak_freq <= profile.peak_freq_high else 28.0
+    else:
+        nearest = min(abs(peak_freq - profile.freq_min), abs(peak_freq - profile.freq_max))
+        freq_score = 15.0 * max(0, 1 - nearest / (profile.freq_max - profile.freq_min))
+
+    energy_ratio = _band_energy(freqs, power, profile.freq_min, profile.freq_max) / \
+                   (_band_energy(freqs, power, 50, 5000) + 1e-12)
+    freq_score = min(40.0, freq_score * (0.5 + energy_ratio))
+    score += freq_score
+
+    # Burst rate match (30 pts)
+    if profile.burst_rate_min <= burst_rate <= profile.burst_rate_max:
+        score += 30.0
+    else:
+        ratio = (burst_rate / (profile.burst_rate_min + 1e-9)
+                 if burst_rate < profile.burst_rate_min
+                 else profile.burst_rate_max / (burst_rate + 1e-9))
+        score += 30.0 * max(0, min(1, ratio))
+
+    # Amplitude match (20 pts)
+    if profile.amp_min <= amplitude_db <= profile.amp_max:
+        score += 20.0
+    else:
+        diff = (profile.amp_min - amplitude_db if amplitude_db < profile.amp_min
+                else amplitude_db - profile.amp_max)
+        score += max(0, 20.0 - diff * 1.5)
+
+    # Temporal pattern (10 pts)
+    if temporal_pattern == profile.pattern:
+        score += 10.0
+    elif {temporal_pattern, profile.pattern} <= {"burst", "rhythmic"}:
+        score += 4.0
+
+    return round(score, 2)
+
+
+def identify_pest_signal(raw_signal: np.ndarray,
+                          sampling_rate: float = 44100.0,
+                          top_n: int = 3,
+                          min_duration_sec: float = 5.0) -> List[IdentificationResult]:
+    """
+    Full vibration-based pest identification pipeline.
+    Returns a ranked list of IdentificationResult (best match first).
+    Raises ValueError for signals that are too short or sampled too slowly.
+    """
+    duration = len(raw_signal) / sampling_rate
+    if duration < min_duration_sec:
+        raise ValueError(
+            f"Signal too short ({duration:.1f}s). Minimum is {min_duration_sec}s."
+        )
+    if sampling_rate < 10_000:
+        raise ValueError("Sampling rate must be ≥ 10,000 Hz.")
+
+    filtered = _bandpass_filter(raw_signal, sampling_rate)
+    burst_idx, burst_rate, amplitude_db = _detect_bursts(filtered, sampling_rate)
+
+    if len(burst_idx) == 0:
+        return []
+
+    win = int(0.05 * sampling_rate)
+    seg = filtered[burst_idx[0] * win: (burst_idx[0] + 1) * win]
+    freqs, power, peak_freq = _compute_spectrum(seg, sampling_rate)
+    pattern = _classify_pattern(burst_idx, burst_rate)
+
+    if _is_background_noise(freqs, power, amplitude_db):
+        print("[PestDetect] Signal resembles background noise — skipping.")
+        return []
+
+    scored = sorted(
+        [(p, _score_profile(p, peak_freq, burst_rate, amplitude_db, pattern, freqs, power))
+         for p in VIBRATION_PROFILES],
+        key=lambda x: x[1], reverse=True,
+    )
+
+    results = []
+    for rank, (profile, score) in enumerate(scored[:top_n], 1):
+        confidence = ("High"               if score >= 70
+                      else "Medium"        if score >= 45
+                      else "Low"           if score >= 25
+                      else "Insufficient signal")
+        results.append(IdentificationResult(
+            rank=rank, pest=profile, score=score, confidence=confidence,
+            peak_freq_hz=round(peak_freq, 1),
+            burst_rate_per_sec=round(burst_rate, 3),
+            amplitude_db=round(amplitude_db, 1),
+            temporal_pattern=pattern,
+        ))
+    return results
+
+
+def generate_vibration_report(results: List[IdentificationResult],
+                               sensor_depth_cm: float = 10.0) -> str:
+    """Format identification results into a human-readable report string."""
+    if not results:
+        return (
+            "No significant insect vibration detected. "
+            "The signal may be background noise, or pests may be outside "
+            "the sensor detection radius (~20-30 cm). "
+            "Reposition sensor and re-record."
+        )
+    r0 = results[0]
+    lines = [
+        f"Sensor depth: {sensor_depth_cm} cm | "
+        f"Peak freq: {r0.peak_freq_hz} Hz | "
+        f"Burst rate: {r0.burst_rate_per_sec}/s | "
+        f"Amplitude: {r0.amplitude_db} dB | "
+        f"Pattern: {r0.temporal_pattern}",
+        "TOP CANDIDATES:",
+    ]
+    for r in results:
+        icon = {"High": "✔", "Medium": "◈", "Low": "?"}.get(r.confidence, "✗")
+        lines.append(
+            f"#{r.rank} {icon} {r.pest.common_name} — score {r.score}/100 "
+            f"({r.confidence}) | {r.pest.damage_type} | Tx: {r.pest.treatment}"
+        )
+    return "\n".join(lines)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def clean_phone(phone: str) -> str:
-    """Normalise any Lesotho number to +266XXXXXXXX format."""
     phone = phone.strip().replace(" ", "").replace("-", "")
     if phone.startswith("00266"):
         return "+" + phone[2:]
@@ -155,44 +405,6 @@ def clean_phone(phone: str) -> str:
     if not phone.startswith("+"):
         return "+266" + phone
     return phone
-
-
-def _dominant_frequency(signal: list, sampling_rate: int) -> float:
-    arr = np.array(signal, dtype=float)
-    n   = len(arr)
-    if n < 2:
-        return 0.0
-    fft_vals = np.abs(np.fft.rfft(arr - arr.mean()))
-    freqs    = np.fft.rfftfreq(n, d=1.0 / sampling_rate)
-    if len(fft_vals) < 2:
-        return 0.0
-    dominant_idx = np.argmax(fft_vals[1:]) + 1
-    return float(freqs[dominant_idx])
-
-
-def _match_pests(signal: list, sampling_rate: int, top_n: int = 3) -> list:
-    dom_freq  = _dominant_frequency(signal, sampling_rate)
-    amplitude = float(np.std(signal))
-    results   = []
-    for profile in PEST_PROFILES:
-        lo, hi   = profile["freq_lo"], profile["freq_hi"]
-        center   = (lo + hi) / 2.0
-        width    = (hi - lo) / 2.0
-        if width > 0:
-            freq_score = max(0.0, 1.0 - abs(dom_freq - center) / (width * 2))
-        else:
-            freq_score = 1.0 if lo <= dom_freq <= hi else 0.0
-        amplitude_bonus = min(0.2, amplitude * 0.1)
-        score = round(min(100, (freq_score + amplitude_bonus) * 100), 1)
-        if score >= 5.0:
-            confidence = "High" if score >= 65 else "Medium" if score >= 35 else "Low"
-            results.append({
-                "pest": profile["pest"], "score": score,
-                "confidence": confidence, "damage": profile["damage"],
-                "treatment": profile["treatment"],
-            })
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_n]
 
 # ─── Global model state ───────────────────────────────────────────────────────
 
@@ -264,9 +476,7 @@ def fetch_history_df() -> pd.DataFrame:
         print("[Firebase] No history data found.")
         return pd.DataFrame()
 
-    rows      = []
-    total_raw = 0
-
+    rows, total_raw = [], 0
     for entry in raw.values():
         if not isinstance(entry, dict):
             continue
@@ -275,21 +485,19 @@ def fetch_history_df() -> pd.DataFrame:
         for fb_field, our_field in FIELD_ALIASES.items():
             if fb_field in entry and our_field not in row:
                 raw_val = entry[fb_field]
-                row[our_field] = _parse_pest_status(raw_val) if our_field == "pest_presence" else raw_val
+                row[our_field] = (_parse_pest_status(raw_val)
+                                  if our_field == "pest_presence" else raw_val)
         rows.append(row)
 
     if not rows:
-        print("[Firebase] No parseable rows found.")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-
     for col, default in LESOTHO_MEANS.items():
         if col not in df.columns:
             df[col] = default
         else:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
-
     for col in FEATURES:
         if col not in df.columns:
             df[col] = np.nan
@@ -299,15 +507,14 @@ def fetch_history_df() -> pd.DataFrame:
     df.dropna(subset=["soil_moisture", "soil_temperature", "pest_presence"], inplace=True)
     df.dropna(subset=FEATURES, inplace=True)
 
-    valid_mask = (
+    valid = (
         (df["soil_temperature"] >= -10) & (df["soil_temperature"] <= 60) &
         (df["soil_moisture"]    >=   0) & (df["soil_moisture"]    <= 100)
     )
-    df      = df[valid_mask].copy()
+    df      = df[valid].copy()
     skipped = total_raw - len(df)
 
     if df.empty:
-        print(f"[Firebase] All {total_raw} rows were invalid.")
         return df
 
     df = _derive_labels(df)
@@ -319,33 +526,25 @@ def fetch_history_df() -> pd.DataFrame:
 # ─── Label derivation ─────────────────────────────────────────────────────────
 
 def _derive_labels(df: pd.DataFrame) -> pd.DataFrame:
-    sm  = df["soil_moisture"].values
-    st  = df["soil_temperature"].values
-    pp  = df["pest_presence"].values
-    at  = df["air_temperature"].values
-    rf  = df["rainfall"].values
-    hum = df["humidity"].values
+    sm, st, pp = df["soil_moisture"].values, df["soil_temperature"].values, df["pest_presence"].values
+    at, rf, hum = df["air_temperature"].values, df["rainfall"].values, df["humidity"].values
 
     df["irrigation_needed"] = ((sm < 35) & (rf < 2)).astype(int)
 
     pest_score = (
-        pp * 0.50 +
-        (hum > 70).astype(float) * 0.25 +
-        (st  > 25).astype(float) * 0.15 +
-        (at  > 28).astype(float) * 0.10
+        pp * 0.50 + (hum > 70).astype(float) * 0.25 +
+        (st > 25).astype(float) * 0.15 + (at > 28).astype(float) * 0.10
     )
     df["pest_risk"] = np.where(pest_score > 0.6, 2, np.where(pest_score > 0.3, 1, 0))
 
     planting_score = (
         ((sm >= 40) & (sm <= 70)).astype(float) * 0.35 +
         ((st >= 15) & (st <= 25)).astype(float) * 0.30 +
-        (rf <  3).astype(float)                  * 0.20 +
+        (rf < 3).astype(float)                  * 0.20 +
         ((at >= 18) & (at <= 28)).astype(float) * 0.15
     )
-    df["planting_window"] = np.where(
-        planting_score > 0.70, 2,
-        np.where(planting_score > 0.40, 1, 0)
-    )
+    df["planting_window"] = np.where(planting_score > 0.70, 2,
+                                     np.where(planting_score > 0.40, 1, 0))
     return df
 
 # ─── Seed data ────────────────────────────────────────────────────────────────
@@ -368,37 +567,30 @@ def generate_lesotho_seed_data(n: int = 2000) -> pd.DataFrame:
 def train_models(df: pd.DataFrame, history_count: int = 0):
     _state["meta"]["is_training"] = True
     print(f"\nTraining on {len(df)} samples ({history_count} from Firebase)...")
-
-    X        = df[FEATURES].values
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    models     = {}
-    accuracies = {}
+    X, scaler = df[FEATURES].values, StandardScaler()
+    Xs        = scaler.fit_transform(X)
+    models, accuracies = {}, {}
 
     for target in TARGETS:
         y = df[target].values
         try:
-            Xtr, Xte, ytr, yte = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+            Xtr, Xte, ytr, yte = train_test_split(Xs, y, test_size=0.2, random_state=42, stratify=y)
         except ValueError:
-            Xtr, Xte, ytr, yte = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-
+            Xtr, Xte, ytr, yte = train_test_split(Xs, y, test_size=0.2, random_state=42)
         clf = RandomForestClassifier(
             n_estimators=200, max_depth=12, min_samples_leaf=5,
             class_weight="balanced", random_state=42, n_jobs=-1,
         )
         clf.fit(Xtr, ytr)
-        acc                = float(accuracy_score(yte, clf.predict(Xte)))
-        models[target]     = clf
-        accuracies[target] = round(acc, 4)
+        acc = float(accuracy_score(yte, clf.predict(Xte)))
+        models[target], accuracies[target] = clf, round(acc, 4)
         print(f"  [{target}] accuracy = {acc:.3f}")
 
     joblib.dump(scaler, f"{MODEL_DIR}/scaler.pkl")
     for name, model in models.items():
         joblib.dump(model, f"{MODEL_DIR}/{name}.pkl")
 
-    _state["models"] = models
-    _state["scaler"] = scaler
+    _state["models"], _state["scaler"] = models, scaler
     _state["meta"].update({
         "last_trained":    datetime.utcnow().isoformat() + "Z",
         "seed_samples":    len(df) - history_count,
@@ -407,10 +599,8 @@ def train_models(df: pd.DataFrame, history_count: int = 0):
         "is_training":     False,
         "accuracy":        accuracies,
     })
-
     with open(f"{MODEL_DIR}/meta.json", "w") as fh:
         json.dump(_state["meta"], fh, indent=2)
-
     print(f"Training complete — {len(df)} total, {history_count} from Firebase.\n")
 
 # ─── Sync + train pipeline ────────────────────────────────────────────────────
@@ -421,17 +611,13 @@ def sync_and_train():
         history_count = len(df_history)
         seed_n        = max(200, 2000 - history_count * 3)
         df_seed       = generate_lesotho_seed_data(seed_n)
-
         if history_count >= MIN_HISTORY_FOR_BLEND:
             df_combined = pd.concat([df_seed, df_history], ignore_index=True)
             print(f"[Blend] {seed_n} seed + {history_count} Firebase = {len(df_combined)} rows")
         else:
             df_combined = df_seed
             print(f"[Blend] Firebase too small ({history_count} rows) — seed only")
-
         train_models(df_combined, history_count=history_count)
-
-# ─── Auto-retrain loop ────────────────────────────────────────────────────────
 
 def _auto_retrain_loop():
     while True:
@@ -439,23 +625,200 @@ def _auto_retrain_loop():
         print(f"\nScheduled retrain (every {RETRAIN_INTERVAL_HOURS}h)")
         sync_and_train()
 
-# ─── AUTO SMS: fetch farmers from Firebase and send ──────────────────────────
+# ─── VIBRATION WATCHER — Firebase chunk reassembly + auto-analysis ───────────
+#
+# The Arduino (ESP32) uploads vibration data in chunks to Firebase:
+#   vibrationSamples/chunk_0 → {0: 0.00123, 1: 0.00456, ...}  (2000 samples)
+#   vibrationSamples/chunk_1 → ...
+#   ...
+#   vibrationSamples/chunk_49 → ...
+#   vibrationMeta/ready → true   ← set by Arduino when all chunks are uploaded
+#
+# This watcher polls for the ready flag every VIBRATION_POLL_INTERVAL seconds.
+# When it fires it:
+#   1. Reads vibrationMeta for sample_rate, chunk_size, total_chunks
+#   2. Reassembles all chunks into one flat numpy array
+#   3. Runs identify_pest_signal() on the assembled signal
+#   4. Writes results to Firebase at vibrationAnalysis/
+#   5. Clears the ready flag so the same data isn't reprocessed
+# ─────────────────────────────────────────────────────────────────────────────
 
-def auto_send_sms_to_farmers(_unused_recommendation: str = ""):
+VIBRATION_DEVICE_PATH   = "soil_monitoring_system/sensors/device001"
+VIBRATION_POLL_INTERVAL = 15   # seconds between ready-flag checks
+
+
+def _reassemble_chunks(chunks_data: dict, chunk_size: int, total_chunks: int) -> np.ndarray:
     """
-    Automatically called by /predict after every prediction.
-    Reads the SMS text from soil_monitoring_system/aiRecommendation/text in Firebase
-    so the message is always in sync with what the app displays.
-    Fetches all smsEnabled farmers from Firebase and sends them the update.
-    No app needs to be open — this runs entirely on the backend.
+    Rebuild the flat signal array from the chunk dict Firebase returns.
+    Each chunk key is 'chunk_N' and its value is a dict of {str(index): float}.
     """
+    signal = []
+    for chunk_idx in range(total_chunks):
+        key   = f"chunk_{chunk_idx}"
+        chunk = chunks_data.get(key)
+        if not chunk or not isinstance(chunk, dict):
+            print(f"[VibWatch] Missing chunk_{chunk_idx} — padding with zeros")
+            signal.extend([0.0] * chunk_size)
+            continue
+        # Firebase returns dict keys as strings; sort numerically
+        ordered = [float(chunk[str(i)]) for i in range(len(chunk)) if str(i) in chunk]
+        signal.extend(ordered)
+    return np.array(signal, dtype=float)
+
+
+def _process_vibration_from_firebase():
+    """
+    Called by the watcher thread when vibrationMeta/ready == true.
+    Fetches chunks, analyses the signal, writes results back to Firebase.
+    """
+    device_path = VIBRATION_DEVICE_PATH
+    print("[VibWatch] ready=true detected — starting analysis...")
+
+    # ── 1. Read metadata ─────────────────────────────────────────────────────
+    meta = firebase_get(f"{device_path}/vibrationMeta")
+    if not meta or not isinstance(meta, dict):
+        print("[VibWatch] vibrationMeta missing — aborting")
+        return
+
+    sample_rate   = int(meta.get("sampleRate",   10000))
+    chunk_size    = int(meta.get("chunkSize",     2000))
+    total_chunks  = int(meta.get("totalChunks",   50))
+    duration_sec  = float(meta.get("durationSec", 10.0))
+    sensor_depth  = float(firebase_get(f"{device_path}/sensorDepthCm") or 10.0)
+
+    print(f"[VibWatch] Meta: {sample_rate}Hz × {duration_sec}s, "
+          f"{total_chunks} chunks × {chunk_size} samples")
+
+    # ── 2. Clear the ready flag immediately so we don't reprocess ────────────
+    firebase_set(f"{device_path}/vibrationMeta", {**meta, "ready": False})
+
+    # ── 3. Fetch all chunks ──────────────────────────────────────────────────
+    chunks_data = firebase_get(f"{device_path}/vibrationSamples")
+    if not chunks_data or not isinstance(chunks_data, dict):
+        print("[VibWatch] No vibrationSamples found — aborting")
+        _write_vibration_error("No vibration sample chunks found in Firebase.")
+        return
+
+    print(f"[VibWatch] Fetched {len(chunks_data)} chunks from Firebase")
+
+    # ── 4. Reassemble flat signal ────────────────────────────────────────────
+    signal = _reassemble_chunks(chunks_data, chunk_size, total_chunks)
+    print(f"[VibWatch] Reassembled signal: {len(signal)} samples "
+          f"({len(signal)/sample_rate:.1f}s @ {sample_rate}Hz)")
+
+    if len(signal) < sample_rate * 5:
+        msg = (f"Signal too short after reassembly ({len(signal)} samples, "
+               f"{len(signal)/sample_rate:.1f}s). Need at least 5s.")
+        print(f"[VibWatch] {msg}")
+        _write_vibration_error(msg)
+        return
+
+    # ── 5. Run identification pipeline ──────────────────────────────────────
+    try:
+        results = identify_pest_signal(
+            raw_signal=signal,
+            sampling_rate=float(sample_rate),
+            top_n=3,
+            min_duration_sec=5.0,
+        )
+    except Exception as e:
+        print(f"[VibWatch] identify_pest_signal error: {e}")
+        _write_vibration_error(str(e))
+        return
+
+    report = generate_vibration_report(results, sensor_depth_cm=sensor_depth)
+
+    # ── 6. Build Firebase payload ────────────────────────────────────────────
+    matches_payload = []
+    for r in results:
+        matches_payload.append({
+            "rank":               r.rank,
+            "pest":               r.pest.common_name,
+            "scientificName":     r.pest.name.replace("_", " "),
+            "score":              r.score,
+            "confidence":         r.confidence,
+            "peakFreqHz":         r.peak_freq_hz,
+            "burstRatePerSec":    r.burst_rate_per_sec,
+            "amplitudeDb":        r.amplitude_db,
+            "temporalPattern":    r.temporal_pattern,
+            "damageType":         r.pest.damage_type,
+            "treatment":          r.pest.treatment,
+        })
+
+    if not results:
+        summary = ("No significant insect vibration detected. "
+                   "Signal may be background noise or pest is outside sensor range.")
+    elif results[0].confidence == "High":
+        summary = (f"Strong match: {results[0].pest.common_name} detected "
+                   f"(score {results[0].score}/100). Immediate inspection recommended.")
+    elif results[0].confidence == "Medium":
+        summary = (f"Possible activity: {results[0].pest.common_name} "
+                   f"(score {results[0].score}/100). Monitor over next 24-48 hours.")
+    else:
+        summary = (f"Weak signal — possible {results[0].pest.common_name}. "
+                   "Confirm by soil sampling within 20 cm of sensor.")
+
+    payload = {
+        "timestamp":         datetime.utcnow().isoformat() + "Z",
+        "sampleRate":        sample_rate,
+        "signalSamples":     len(signal),
+        "signalDurationSec": round(len(signal) / sample_rate, 2),
+        "sensorDepthCm":     sensor_depth,
+        "summary":           summary,
+        "report":            report,
+        "matches":           matches_payload,
+        "error":             None,
+        "analysedAt":        datetime.utcnow().isoformat() + "Z",
+    }
+
+    # ── 7. Write results to Firebase ─────────────────────────────────────────
+    ok = firebase_set(f"{device_path}/vibrationAnalysis", payload)
+    if ok:
+        print(f"[VibWatch] ✅ Results written to Firebase | {summary[:80]}")
+    else:
+        print("[VibWatch] ❌ Failed to write results to Firebase")
+
+
+def _write_vibration_error(msg: str):
+    """Write an error result to Firebase so the app can display it."""
+    firebase_set(
+        f"{VIBRATION_DEVICE_PATH}/vibrationAnalysis",
+        {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "summary":   f"Analysis failed: {msg}",
+            "report":    msg,
+            "matches":   [],
+            "error":     msg,
+        }
+    )
+
+
+def _vibration_watcher_loop():
+    """
+    Background thread: polls Firebase every VIBRATION_POLL_INTERVAL seconds.
+    When vibrationMeta/ready == true the Arduino has finished uploading —
+    trigger chunk reassembly and pest identification.
+    """
+    print(f"[VibWatch] Watcher started — polling every {VIBRATION_POLL_INTERVAL}s")
+    while True:
+        try:
+            meta = firebase_get(f"{VIBRATION_DEVICE_PATH}/vibrationMeta")
+            if meta and isinstance(meta, dict) and meta.get("ready") is True:
+                _process_vibration_from_firebase()
+        except Exception as e:
+            print(f"[VibWatch] Poll error: {e}")
+        time.sleep(VIBRATION_POLL_INTERVAL)
+
+
+# ─── AUTO SMS ─────────────────────────────────────────────────────────────────
+
+def auto_send_sms_to_farmers(_unused: str = ""):
     global last_recommendation_sent
 
     if not AT_USERNAME or not AT_API_KEY or AT_USERNAME.lower() == "sandbox":
         print("[SMS] Skipping auto-send — not in live mode")
         return
 
-    # ── Step 1: Fetch recommendation text from Firebase ──────────────────────
     ai_rec = firebase_get("soil_monitoring_system/aiRecommendation")
     if not ai_rec or not isinstance(ai_rec, dict):
         print("[SMS] No aiRecommendation node found in Firebase — skipping")
@@ -466,14 +829,12 @@ def auto_send_sms_to_farmers(_unused_recommendation: str = ""):
         print("[SMS] aiRecommendation/text is empty — skipping")
         return
 
-    # ── Step 2: Skip if the text hasn't changed since last send ──────────────
     if recommendation == last_recommendation_sent:
         print("[SMS] Recommendation unchanged — skipping auto-send")
         return
 
-    print(f"[SMS] New recommendation from Firebase: {recommendation[:80]}...")
+    print(f"[SMS] New recommendation: {recommendation[:80]}...")
 
-    # ── Step 3: Fetch SMS-enabled farmers from Firebase ───────────────────────
     try:
         users_data = firebase_get("users")
         if not users_data or not isinstance(users_data, dict):
@@ -491,21 +852,15 @@ def auto_send_sms_to_farmers(_unused_recommendation: str = ""):
         ]
 
         if not farmers:
-            print("[SMS] No SMS-enabled farmers found in Firebase")
+            print("[SMS] No SMS-enabled farmers found")
             return
 
-        print(f"[SMS] Auto-sending to {len(farmers)} farmer(s)...")
-
-        now     = time.time()
-        sent    = 0
-        skipped = 0
-        errors  = 0
+        now, sent, skipped, errors = time.time(), 0, 0, 0
 
         for farmer in farmers:
             phone = clean_phone(farmer["phone"])
             name  = farmer["name"]
 
-            # Per-farmer cooldown check
             if now - last_sms_sent.get(phone, 0) < SMS_COOLDOWN:
                 remaining = int(SMS_COOLDOWN - (now - last_sms_sent.get(phone, 0)))
                 print(f"[SMS] Skipping {phone} — cooldown {remaining // 60}m remaining")
@@ -514,30 +869,58 @@ def auto_send_sms_to_farmers(_unused_recommendation: str = ""):
 
             try:
                 message = (
-                    f"AGRI ALERT for {name}:\n"
-                    f"{recommendation}\n"
+                    f"AGRI ALERT for {name}:\n{recommendation}\n"
                     f"— SoilApp {datetime.now().strftime('%d/%m/%Y %H:%M')}"
                 )
                 if len(message) > 320:
                     message = message[:317] + "..."
-
                 response = sms_client.send(message, [phone])
                 last_sms_sent[phone] = now
                 sent += 1
-                print(f"[SMS] ✅ Sent to {phone} ({name}) | Response: {response}")
-
+                print(f"[SMS] ✅ Sent to {phone} ({name}) | {response}")
             except Exception as e:
                 errors += 1
                 print(f"[SMS] ❌ Failed for {phone} ({name}): {e}")
 
-        # Only mark recommendation as sent if at least one SMS went out
         if sent > 0:
             last_recommendation_sent = recommendation
 
-        print(f"[SMS] Auto-send complete — sent: {sent}, skipped: {skipped}, errors: {errors}")
+        print(f"[SMS] Done — sent: {sent}, skipped: {skipped}, errors: {errors}")
 
     except Exception as e:
         print(f"[SMS] Auto-send error: {e}")
+
+# ─── AI RECOMMENDATION WATCHER ───────────────────────────────────────────────
+#
+# Polls aiRecommendation/timestamp every AI_REC_POLL_INTERVAL seconds.
+# Fires SMS immediately whenever the timestamp changes — regardless of whether
+# /predict was the source of the update. This means any service or manual
+# update to aiRecommendation will also trigger farmer notifications.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ai_recommendation_watcher_loop():
+    global last_recommendation_ts, last_recommendation_sent
+    print(f"[RecWatch] Watcher started — polling every {AI_REC_POLL_INTERVAL}s")
+    while True:
+        try:
+            ai_rec = firebase_get("soil_monitoring_system/aiRecommendation")
+            if ai_rec and isinstance(ai_rec, dict):
+                new_ts   = ai_rec.get("timestamp", "")
+                new_text = ai_rec.get("text", "").strip()
+
+                # Fire SMS only when timestamp has changed AND text is not empty
+                if new_ts and new_text and new_ts != last_recommendation_ts:
+                    print(f"[RecWatch] New aiRecommendation detected (ts: {new_ts})")
+                    print(f"[RecWatch] Text: {new_text[:80]}...")
+                    last_recommendation_ts = new_ts
+                    # Call SMS directly — bypass the text-change guard in
+                    # auto_send_sms_to_farmers by resetting the last sent tracker
+                    last_recommendation_sent = ""
+                    auto_send_sms_to_farmers()
+        except Exception as e:
+            print(f"[RecWatch] Poll error: {e}")
+        time.sleep(AI_REC_POLL_INTERVAL)
+
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
@@ -546,7 +929,7 @@ def _startup():
     if all(os.path.exists(p) for p in model_paths):
         _state["scaler"] = joblib.load(f"{MODEL_DIR}/scaler.pkl")
         _state["models"] = {t: joblib.load(f"{MODEL_DIR}/{t}.pkl") for t in TARGETS}
-        meta_path        = f"{MODEL_DIR}/meta.json"
+        meta_path = f"{MODEL_DIR}/meta.json"
         if os.path.exists(meta_path):
             with open(meta_path) as fh:
                 _state["meta"].update(json.load(fh))
@@ -555,8 +938,9 @@ def _startup():
     else:
         print("First run — training on seed + Firebase history...")
         sync_and_train()
-
     threading.Thread(target=_auto_retrain_loop, daemon=True).start()
+    threading.Thread(target=_vibration_watcher_loop, daemon=True).start()
+    threading.Thread(target=_ai_recommendation_watcher_loop, daemon=True).start()
 
 _startup()
 
@@ -564,15 +948,10 @@ _startup()
 
 app = FastAPI(
     title="SoilApp AI Backend",
-    description="Random Forest models + automatic SMS notifications for Lesotho farmers",
-    version="7.1.0",
+    description="Random Forest models + scientific vibration pest detection + Firebase vibration watcher + auto SMS for Lesotho farmers",
+    version="9.1.0",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -600,24 +979,33 @@ class ManualReadings(BaseModel):
     readings: list[dict]
 
 class PestDetectInput(BaseModel):
-    signal:          List[float] = Field(..., description="Vibration samples in m/s²")
-    sampling_rate:   int         = Field(10000, ge=100,  le=50000)
-    sensor_depth_cm: float       = Field(10.0,  ge=0,    le=100)
-    top_n:           int         = Field(3,      ge=1,    le=7)
+    signal:          List[float] = Field(..., description="Vibration samples in m/s² from soil sensor")
+    sampling_rate:   float       = Field(44100.0, ge=10000, le=100000,
+                                         description="Sensor sampling rate in Hz (min 10,000)")
+    sensor_depth_cm: float       = Field(10.0,    ge=0,    le=100)
+    top_n:           int         = Field(3,        ge=1,    le=8)
+    min_duration_sec: float      = Field(5.0,      ge=1.0,
+                                         description="Minimum recording length in seconds")
 
-class PestMatch(BaseModel):
-    pest:       str
-    score:      float
-    confidence: str
-    damage:     str
-    treatment:  str
+class PestMatchResult(BaseModel):
+    rank:               int
+    pest:               str
+    scientific_name:    str
+    score:              float
+    confidence:         str
+    peak_freq_hz:       float
+    burst_rate_per_sec: float
+    amplitude_db:       float
+    temporal_pattern:   str
+    damage_type:        str
+    treatment:          str
 
 class PestDetectResponse(BaseModel):
-    dominant_frequency_hz: float
-    signal_std:            float
-    sensor_depth_cm:       float
-    matches:               List[PestMatch]
-    summary:               str
+    matches:            List[PestMatchResult]
+    summary:            str
+    report:             str
+    sensor_depth_cm:    float
+    signal_duration_sec: float
 
 class OtpRequest(BaseModel):
     phone: str
@@ -658,17 +1046,38 @@ def health():
         sms_mode = "sandbox" if AT_USERNAME.lower() == "sandbox" else "live"
     return {
         "status":        "ok",
-        "version":       "7.1.0",
+        "version":       "9.1.0",
         "models_loaded": list(_state["models"].keys()),
         "is_training":   _state["meta"]["is_training"],
         "sms_mode":      sms_mode,
         "at_username":   AT_USERNAME or "NOT SET",
+        "pest_profiles": len(VIBRATION_PROFILES),
+        "vib_watcher":   f"polling every {VIBRATION_POLL_INTERVAL}s",
+        "rec_watcher":   f"polling every {AI_REC_POLL_INTERVAL}s",
     }
 
 
 @app.get("/model-status")
 def model_status():
     return _state["meta"]
+
+
+@app.get("/vibration-status")
+def vibration_status():
+    """
+    Returns the latest vibration analysis result from Firebase.
+    This is what the app should display after the Arduino finishes uploading.
+    Also shows the current ready flag so you can see if a new upload is pending.
+    """
+    analysis = firebase_get(f"{VIBRATION_DEVICE_PATH}/vibrationAnalysis")
+    meta      = firebase_get(f"{VIBRATION_DEVICE_PATH}/vibrationMeta")
+    ready     = meta.get("ready", False) if isinstance(meta, dict) else False
+    return {
+        "ready_flag":       ready,
+        "poll_interval_sec": VIBRATION_POLL_INTERVAL,
+        "device_path":      VIBRATION_DEVICE_PATH,
+        "latest_analysis":  analysis or {"summary": "No analysis run yet."},
+    }
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -691,16 +1100,10 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
 
     pest_label     = PEST_MAP[pest_c]
     planting_label = PLANTING_MAP[plan_c]
-
-    importance = dict(zip(
-        FEATURES,
-        _state["models"]["irrigation_needed"].feature_importances_.round(3).tolist()
-    ))
-
+    importance     = dict(zip(FEATURES,
+                               _state["models"]["irrigation_needed"].feature_importances_.round(3).tolist()))
     recommendation = build_recommendation(bool(irr_c), pest_label, planting_label)
 
-    # Save recommendation to Firebase — auto_send_sms_to_farmers will read it back
-    # from here so the SMS text always matches exactly what the app displays
     firebase_set(
         "soil_monitoring_system/aiRecommendation",
         {
@@ -712,8 +1115,6 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
         }
     )
 
-    # SMS is triggered in background; it reads the text directly from Firebase
-    # so there is no risk of the message going out of sync with what the app shows
     background_tasks.add_task(auto_send_sms_to_farmers)
 
     return PredictionResponse(
@@ -726,6 +1127,70 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
         recommendation=recommendation,
         featureImportance=importance,
         modelMeta=_state["meta"],
+    )
+
+
+@app.post("/detect_pest", response_model=PestDetectResponse)
+def detect_pest(data: PestDetectInput):
+    """
+    Scientific vibration-based soil pest identification.
+    Uses FFT spectral analysis, burst detection, amplitude measurement,
+    and temporal pattern classification (Mankin et al., 1996-2011).
+
+    Minimum requirements:
+      - signal length ≥ min_duration_sec × sampling_rate samples
+      - sampling_rate ≥ 10,000 Hz
+    """
+    signal_arr   = np.array(data.signal, dtype=float)
+    duration_sec = len(signal_arr) / data.sampling_rate
+
+    try:
+        results = identify_pest_signal(
+            raw_signal=signal_arr,
+            sampling_rate=data.sampling_rate,
+            top_n=data.top_n,
+            min_duration_sec=data.min_duration_sec,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    report  = generate_vibration_report(results, sensor_depth_cm=data.sensor_depth_cm)
+    matches = []
+
+    for r in results:
+        matches.append(PestMatchResult(
+            rank=r.rank,
+            pest=r.pest.common_name,
+            scientific_name=r.pest.name.replace("_", " "),
+            score=r.score,
+            confidence=r.confidence,
+            peak_freq_hz=r.peak_freq_hz,
+            burst_rate_per_sec=r.burst_rate_per_sec,
+            amplitude_db=r.amplitude_db,
+            temporal_pattern=r.temporal_pattern,
+            damage_type=r.pest.damage_type,
+            treatment=r.pest.treatment,
+        ))
+
+    if not matches:
+        summary = ("No significant insect vibration detected. "
+                   "Signal may be background noise or pest is outside sensor range (~20-30 cm).")
+    elif matches[0].confidence == "High":
+        summary = (f"Strong match: {matches[0].pest} detected. "
+                   f"Score {matches[0].score}/100. Immediate field inspection recommended.")
+    elif matches[0].confidence == "Medium":
+        summary = (f"Possible activity: {matches[0].pest}. "
+                   f"Score {matches[0].score}/100. Monitor closely over next 24-48 hours.")
+    else:
+        summary = (f"Weak signal — possible {matches[0].pest}. "
+                   "Confirm by soil sampling within 20 cm of sensor.")
+
+    return PestDetectResponse(
+        matches=matches,
+        summary=summary,
+        report=report,
+        sensor_depth_cm=data.sensor_depth_cm,
+        signal_duration_sec=round(duration_sec, 2),
     )
 
 
@@ -743,10 +1208,10 @@ def retrain_manual(body: ManualReadings, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Need at least 10 readings.")
 
     def _task():
-        df_manual  = _derive_labels(pd.DataFrame(body.readings))
-        df_history = fetch_history_df()
-        df_seed    = generate_lesotho_seed_data(500)
-        frames     = [df_seed, df_manual]
+        df_manual     = _derive_labels(pd.DataFrame(body.readings))
+        df_history    = fetch_history_df()
+        df_seed       = generate_lesotho_seed_data(500)
+        frames        = [df_seed, df_manual]
         if not df_history.empty:
             frames.insert(1, df_history)
         df_combined   = pd.concat(frames, ignore_index=True)
@@ -782,64 +1247,27 @@ def firebase_preview():
         for fb_field, our_field in FIELD_ALIASES.items():
             if fb_field in entry and our_field not in parsed:
                 raw_val = entry[fb_field]
-                parsed[our_field] = _parse_pest_status(raw_val) if our_field == "pest_presence" else raw_val
+                parsed[our_field] = (_parse_pest_status(raw_val)
+                                     if our_field == "pest_presence" else raw_val)
         preview.append({"firebase_key": key, "raw": entry, "parsed": parsed})
     return {"path": FIREBASE_HISTORY_PATH, "total_records": len(raw), "preview": preview}
-
-
-@app.post("/detect_pest", response_model=PestDetectResponse)
-def detect_pest(data: PestDetectInput):
-    if len(data.signal) < 100:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Signal too short ({len(data.signal)} samples). Need at least 100."
-        )
-    dom_freq   = _dominant_frequency(data.signal, data.sampling_rate)
-    signal_std = float(np.std(data.signal))
-    matches    = _match_pests(data.signal, data.sampling_rate, top_n=data.top_n)
-
-    if not matches:
-        summary = "No significant pest vibration signatures detected in this sample."
-    elif matches[0]["confidence"] == "High":
-        summary = f"Strong match: {matches[0]['pest']} detected. Immediate inspection recommended."
-    elif matches[0]["confidence"] == "Medium":
-        summary = f"Possible activity: {matches[0]['pest']}. Monitor closely over next 24-48 hours."
-    else:
-        summary = "Low-level vibration detected. Could be environmental noise or early-stage activity."
-
-    return PestDetectResponse(
-        dominant_frequency_hz=round(dom_freq, 2),
-        signal_std=round(signal_std, 6),
-        sensor_depth_cm=data.sensor_depth_cm,
-        matches=[PestMatch(**m) for m in matches],
-        summary=summary,
-    )
 
 
 @app.post("/send-otp")
 async def send_otp(body: OtpRequest):
     if not AT_USERNAME or not AT_API_KEY:
-        return JSONResponse(
-            {"success": False, "error": "SMS not configured on server. Contact admin."},
-            status_code=503
-        )
+        return JSONResponse({"success": False, "error": "SMS not configured on server."}, status_code=503)
     try:
         phone = clean_phone(body.phone)
         if not phone:
             return JSONResponse({"success": False, "error": "Phone number required"}, status_code=400)
-
-        otp     = str(random.randint(100000, 999999))
-        expires = time.time() + 600  # 10 minutes
-        otp_store[phone] = {"otp": otp, "expires": expires}
-
-        message  = (
-            f"AGRI ALERT: Your SoilApp verification code is {otp}. "
-            f"Valid for 10 minutes. Do not share this code."
-        )
+        otp = str(random.randint(100000, 999999))
+        otp_store[phone] = {"otp": otp, "expires": time.time() + 600}
+        message  = (f"AGRI ALERT: Your SoilApp verification code is {otp}. "
+                    f"Valid for 10 minutes. Do not share this code.")
         response = sms_client.send(message, [phone])
         print(f"[OTP] Sent to {phone} | Response: {response}")
         return JSONResponse({"success": True, "message": f"OTP sent to {phone}"})
-
     except Exception as e:
         print(f"[OTP ERROR] {e}")
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
@@ -850,97 +1278,82 @@ async def verify_otp(body: OtpVerifyRequest):
     try:
         phone  = clean_phone(body.phone)
         record = otp_store.get(phone)
-
         if not record:
-            return JSONResponse(
-                {"success": False, "error": "No OTP found for this number. Please request a new one."},
-                status_code=400
-            )
+            return JSONResponse({"success": False,
+                                 "error": "No OTP found. Please request a new one."}, status_code=400)
         if time.time() > record["expires"]:
             del otp_store[phone]
-            return JSONResponse(
-                {"success": False, "error": "OTP has expired. Please request a new one."},
-                status_code=400
-            )
+            return JSONResponse({"success": False,
+                                 "error": "OTP has expired. Please request a new one."}, status_code=400)
         if record["otp"] != body.otp.strip():
-            return JSONResponse(
-                {"success": False, "error": "Incorrect OTP. Please try again."},
-                status_code=400
-            )
-
+            return JSONResponse({"success": False,
+                                 "error": "Incorrect OTP. Please try again."}, status_code=400)
         del otp_store[phone]
         print(f"[OTP] Verified for {phone}")
         return JSONResponse({"success": True, "message": "Phone number verified."})
-
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/send-sms-recommendation")
 async def send_sms_recommendation(body: SmsRequest):
-    """
-    Manual SMS endpoint — still available if needed.
-    In normal operation, SMS is sent automatically by /predict.
-    This endpoint uses the text passed in the request body,
-    NOT the Firebase aiRecommendation node.
-    """
+    """Manual SMS endpoint. Uses text from request body, not Firebase."""
     if not AT_USERNAME or not AT_API_KEY:
-        return JSONResponse(
-            {"success": False, "error": "SMS credentials not configured on server."},
-            status_code=503
-        )
+        return JSONResponse({"success": False, "error": "SMS credentials not configured."}, status_code=503)
     if not body.farmers or not body.recommendation.strip():
-        return JSONResponse(
-            {"success": False, "error": "Farmers list and recommendation required"},
-            status_code=400
-        )
+        return JSONResponse({"success": False, "error": "Farmers list and recommendation required"}, status_code=400)
 
-    results = []
-    now     = time.time()
-
+    results, now = [], time.time()
     for farmer in body.farmers:
         phone = clean_phone(farmer.phone)
         name  = farmer.name or "Farmer"
-
         if not phone:
             results.append({"phone": "unknown", "status": "skipped — no phone"})
             continue
-
         last_sent = last_sms_sent.get(phone, 0)
         if now - last_sent < SMS_COOLDOWN:
             remaining = int(SMS_COOLDOWN - (now - last_sent))
             results.append({"phone": phone, "status": f"skipped — cooldown {remaining // 60}m remaining"})
             continue
-
         try:
-            message = (
-                f"AGRI ALERT for {name}:\n"
-                f"{body.recommendation}\n"
-                f"— SoilApp {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-            )
+            message = (f"AGRI ALERT for {name}:\n{body.recommendation}\n"
+                       f"— SoilApp {datetime.now().strftime('%d/%m/%Y %H:%M')}")
             if len(message) > 320:
                 message = message[:317] + "..."
-
             response = sms_client.send(message, [phone])
             last_sms_sent[phone] = now
             results.append({"phone": phone, "status": "sent"})
-            print(f"[SMS] ✅ Sent to {phone} ({name}) | Response: {response}")
-
+            print(f"[SMS] ✅ Sent to {phone} ({name}) | {response}")
         except Exception as e:
             results.append({"phone": phone, "status": f"error: {str(e)}"})
             print(f"[SMS] ❌ Failed for {phone}: {e}")
 
-    sent_count    = sum(1 for r in results if r["status"] == "sent")
-    skipped_count = sum(1 for r in results if "skipped" in r["status"])
-    error_count   = sum(1 for r in results if "error"   in r["status"])
-
     return JSONResponse({
         "success": True,
-        "sent":    sent_count,
-        "skipped": skipped_count,
-        "errors":  error_count,
+        "sent":    sum(1 for r in results if r["status"] == "sent"),
+        "skipped": sum(1 for r in results if "skipped" in r["status"]),
+        "errors":  sum(1 for r in results if "error"   in r["status"]),
         "results": results,
     })
+
+
+@app.get("/pest-profiles")
+def pest_profiles():
+    """List all vibration profiles used by the /detect_pest engine."""
+    return [
+        {
+            "name":            p.common_name,
+            "scientific_name": p.name.replace("_", " "),
+            "freq_range_hz":   f"{p.freq_min}–{p.freq_max}",
+            "peak_freq_hz":    f"{p.peak_freq_low}–{p.peak_freq_high}",
+            "burst_rate":      f"{p.burst_rate_min}–{p.burst_rate_max}/s",
+            "amplitude_db":    f"{p.amp_min}–{p.amp_max}",
+            "pattern":         p.pattern,
+            "damage_type":     p.damage_type,
+            "treatment":       p.treatment,
+        }
+        for p in VIBRATION_PROFILES
+    ]
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
