@@ -52,16 +52,49 @@ else:
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms_client = africastalking.SMS
 
-last_sms_sent: dict      = {}
-SMS_COOLDOWN             = 300
+# ─── SMS config ───────────────────────────────────────────────────────────────
+# Cooldown: minimum seconds between the same alert type being sent to the same farmer.
+# Set to 3600 (1 hour) so a persistent bad condition doesn't spam every 60 s.
+SMS_COOLDOWN          = 3600
 
+# Startup grace: block ALL SMS for this many seconds after the server starts.
+# Prevents the deploy double-fire caused by the sensor watcher and recommendation
+# watcher both triggering within seconds of each other on first boot.
+STARTUP_GRACE_SECONDS = 120
+_server_start_time    = time.time()   # captured once at import; never changed
+
+last_sms_sent: dict      = {}
 last_recommendation_sent = ""
 last_recommendation_ts   = ""
-AI_REC_POLL_INTERVAL     = 10
 
-SENSOR_POLL_INTERVAL     = 60
+AI_REC_POLL_INTERVAL  = 10
+SENSOR_POLL_INTERVAL  = 60
 
-otp_store: dict          = {}
+otp_store: dict = {}
+
+# ─── Normal-range thresholds ──────────────────────────────────────────────────
+#
+# These define exactly what "normal" means for each reading.
+# A reading is NORMAL when it sits inside the normal band — no SMS, no alert.
+# A reading is ABNORMAL when it crosses one of the alert thresholds below,
+# which causes the SMS threshold gate to return True and allow a message to send.
+#
+# Soil moisture
+MOISTURE_NORMAL_LOW   = 30    # % — below this AND rainfall < 2 mm → irrigation alert
+MOISTURE_NORMAL_HIGH  = 85    # % — above this → waterlogging warning (logged only for now)
+# Soil temperature
+SOIL_TEMP_NORMAL_LOW  = 5     # °C — below this crops are cold-stressed
+SOIL_TEMP_NORMAL_HIGH = 38    # °C — above this crops are heat-stressed
+# Air temperature
+AIR_TEMP_NORMAL_LOW   = 10    # °C
+AIR_TEMP_NORMAL_HIGH  = 28    # °C — above this pest risk bonus activates
+# Humidity
+HUMIDITY_NORMAL_HIGH  = 70    # % — above this pest risk bonus activates
+# Rainfall
+RAINFALL_LOW          = 2.0   # mm/day — below this combined with dry soil → irrigate
+# Pest score (derived composite, 0–1)
+PEST_SCORE_MEDIUM     = 0.30  # ≥ this → medium risk SMS
+PEST_SCORE_HIGH       = 0.60  # ≥ this → high risk SMS
 
 # ─── Feature / target definitions ─────────────────────────────────────────────
 
@@ -321,7 +354,7 @@ def identify_pest_signal(raw_signal: np.ndarray,
             f"Signal too short ({duration:.1f}s). Minimum is {min_duration_sec}s."
         )
     if sampling_rate < 10_000:
-        raise ValueError("Sampling rate must be ≥ 10,000 Hz.")
+        raise ValueError("Sampling rate must be >= 10,000 Hz.")
 
     filtered = _bandpass_filter(raw_signal, sampling_rate)
     burst_idx, burst_rate, amplitude_db = _detect_bursts(filtered, sampling_rate)
@@ -521,22 +554,38 @@ def _derive_labels(df: pd.DataFrame) -> pd.DataFrame:
     sm, st, pp = df["soil_moisture"].values, df["soil_temperature"].values, df["pest_presence"].values
     at, rf, hum = df["air_temperature"].values, df["rainfall"].values, df["humidity"].values
 
-    df["irrigation_needed"] = ((sm < 35) & (rf < 2)).astype(int)
+    # Irrigation needed: moisture below normal low AND rainfall below threshold
+    df["irrigation_needed"] = (
+        (sm < MOISTURE_NORMAL_LOW) & (rf < RAINFALL_LOW)
+    ).astype(int)
 
+    # Pest risk composite score (0–1):
+    #   pest flag  × 0.50  (dominant — direct sensor evidence)
+    #   humidity   × 0.25  (fungal/insect activity amplified by moisture in air)
+    #   soil temp  × 0.15  (warm soil accelerates larval development)
+    #   air temp   × 0.10  (warm air favours adult pest activity)
     pest_score = (
-        pp * 0.50 + (hum > 70).astype(float) * 0.25 +
-        (st > 25).astype(float) * 0.15 + (at > 28).astype(float) * 0.10
+        pp * 0.50
+        + (hum > HUMIDITY_NORMAL_HIGH).astype(float)   * 0.25
+        + (st  > 25).astype(float)                     * 0.15
+        + (at  > AIR_TEMP_NORMAL_HIGH).astype(float)   * 0.10
     )
-    df["pest_risk"] = np.where(pest_score > 0.6, 2, np.where(pest_score > 0.3, 1, 0))
+    df["pest_risk"] = np.where(
+        pest_score >= PEST_SCORE_HIGH,   2,
+        np.where(pest_score >= PEST_SCORE_MEDIUM, 1, 0)
+    )
 
+    # Planting window: composite of moisture, soil temp, rainfall, air temp
     planting_score = (
-        ((sm >= 40) & (sm <= 70)).astype(float) * 0.35 +
-        ((st >= 15) & (st <= 25)).astype(float) * 0.30 +
-        (rf < 3).astype(float)                  * 0.20 +
-        ((at >= 18) & (at <= 28)).astype(float) * 0.15
+        ((sm >= MOISTURE_NORMAL_LOW) & (sm <= MOISTURE_NORMAL_HIGH)).astype(float) * 0.35
+        + ((st >= SOIL_TEMP_NORMAL_LOW) & (st <= 25)).astype(float)                * 0.30
+        + (rf < 3).astype(float)                                                   * 0.20
+        + ((at >= AIR_TEMP_NORMAL_LOW)  & (at <= AIR_TEMP_NORMAL_HIGH)).astype(float) * 0.15
     )
-    df["planting_window"] = np.where(planting_score > 0.70, 2,
-                                     np.where(planting_score > 0.40, 1, 0))
+    df["planting_window"] = np.where(
+        planting_score > 0.70, 2,
+        np.where(planting_score > 0.40, 1, 0)
+    )
     return df
 
 # ─── Seed data ────────────────────────────────────────────────────────────────
@@ -803,6 +852,38 @@ def _validate_sensor_data(data: dict) -> Optional[dict]:
     }
 
 
+def _conditions_warrant_sms(irr: bool, pest: str, planting: str,
+                              sensor: Optional[dict] = None) -> bool:
+    """
+    Gate function — returns True only when at least one reading has genuinely
+    crossed a threshold that a farmer needs to act on.
+
+    Normal (returns False, no SMS):
+      moisture 30–85 %  |  no pest flag  |  humidity ≤ 70 %  |  rainfall ≥ 2 mm
+
+    Alert (returns True, SMS allowed):
+      - Irrigation: moisture < 30 % AND rainfall < 2 mm
+      - Pest:       pest_risk is 'medium' or 'high'
+      - Planting:   optimal window AND conditions are otherwise safe
+    """
+    # Irrigation alert — only when BOTH moisture is low AND it has not rained
+    if irr:
+        sm = sensor.get("soil_moisture", 100) if sensor else 100
+        rf = sensor.get("rainfall",      10)  if sensor else 10
+        if sm < MOISTURE_NORMAL_LOW and rf < RAINFALL_LOW:
+            return True
+
+    # Pest alert — medium or high risk
+    if pest in ("medium", "high"):
+        return True
+
+    # Positive planting alert — only when everything else is safe
+    if planting == "optimal" and not irr and pest == "low":
+        return True
+
+    return False
+
+
 def _run_prediction_from_sensor(clean: dict) -> bool:
     if not _state["models"] or _state["scaler"] is None:
         print("[SensorWatch] Models not ready — skipping prediction")
@@ -826,6 +907,17 @@ def _run_prediction_from_sensor(clean: dict) -> bool:
     pest_label     = PEST_MAP[pest_c]
     planting_label = PLANTING_MAP[plan_c]
     recommendation = build_recommendation(bool(irr_c), pest_label, planting_label, clean)
+
+    # Only write aiRecommendation (and therefore trigger potential SMS) when
+    # at least one reading has crossed a meaningful threshold.
+    # Normal readings are silently dropped — no Firebase write, no SMS.
+    if not _conditions_warrant_sms(bool(irr_c), pest_label, planting_label, clean):
+        print(
+            f"[SensorWatch] All readings normal "
+            f"(moisture={clean['soil_moisture']:.0f}% "
+            f"pest={pest_label} planting={planting_label}) — no alert written"
+        )
+        return True
 
     ok = firebase_set(
         "soil_monitoring_system/aiRecommendation",
@@ -866,12 +958,11 @@ def _sensor_watcher_loop():
 
 HOURLY_HISTORY_PATH = "soil_monitoring_system/hourlyHistory"
 
-_hourly_buffer: list = []   # accumulates {temperature, moisture} dicts within the current hour
-_current_hour:  int  = -1   # which UTC hour we are currently in
+_hourly_buffer: list = []
+_current_hour:  int  = -1
 
 
 def _flush_hourly_buffer(hour_label: str):
-    """Average the buffer and write one entry to Firebase hourlyHistory."""
     global _hourly_buffer
 
     if not _hourly_buffer:
@@ -884,14 +975,13 @@ def _flush_hourly_buffer(hour_label: str):
 
     entry = {
         "timestamp":   datetime.utcnow().isoformat() + "Z",
-        "hourLabel":   hour_label,        # e.g. "2025-06-01 14:00"
+        "hourLabel":   hour_label,
         "temperature": avg_temp,
         "moisture":    avg_moisture,
         "samples":     sample_count,
     }
 
-    # Use the hour label as the Firebase key so each hour has exactly one entry
-    safe_key = hour_label.replace(" ", "_").replace(":", "-")  # "2025-06-01_14-00"
+    safe_key = hour_label.replace(" ", "_").replace(":", "-")
     ok = firebase_set(f"{HOURLY_HISTORY_PATH}/{safe_key}", entry)
 
     if ok:
@@ -904,11 +994,6 @@ def _flush_hourly_buffer(hour_label: str):
 
 
 def _hourly_average_loop():
-    """
-    Runs every 60s. Reads live sensor data into a buffer.
-    When the clock hour changes, flushes the buffer as a single
-    averaged entry to soil_monitoring_system/hourlyHistory.
-    """
     global _current_hour
 
     print("[HourlyWatch] Started — sampling every 60s, flushing at each new hour")
@@ -928,10 +1013,8 @@ def _hourly_average_loop():
                     hour = now.hour
 
                     if _current_hour == -1:
-                        # First sample — just record the hour, don't flush yet
                         _current_hour = hour
                     elif hour != _current_hour:
-                        # Hour rolled over — flush what we collected
                         hour_label = (
                             now.strftime("%Y-%m-%d") + f" {_current_hour:02d}:00"
                         )
@@ -973,6 +1056,16 @@ def _derive_alert_type(recommendation: str) -> str:
 
 def auto_send_sms_to_farmers(_unused: str = ""):
     global last_recommendation_sent
+
+    # ── Startup grace period ──────────────────────────────────────────────────
+    # Block all SMS for STARTUP_GRACE_SECONDS after the server starts.
+    # This prevents the deploy double-fire where the sensor watcher and the
+    # recommendation watcher both race to send a message within seconds of boot.
+    elapsed = time.time() - _server_start_time
+    if elapsed < STARTUP_GRACE_SECONDS:
+        remaining = int(STARTUP_GRACE_SECONDS - elapsed)
+        print(f"[SMS] Startup grace period active — blocking SMS for {remaining}s more")
+        return
 
     if not AT_USERNAME or not AT_API_KEY or AT_USERNAME.lower() == "sandbox":
         print("[SMS] Skipping auto-send — not in live mode")
@@ -1112,7 +1205,7 @@ app = FastAPI(
         "Random Forest models + scientific vibration pest detection + "
         "Firebase sensor watcher + hourly history + auto SMS for Lesotho farmers"
     ),
-    version="9.3.0",
+    version="9.4.0",
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -1198,7 +1291,7 @@ def build_recommendation(
         if sensor:
             sm = sensor.get("soil_moisture", 0)
             st = sensor.get("soil_temperature", 0)
-            if st > 28:
+            if st > AIR_TEMP_NORMAL_HIGH:
                 extra = f" High temperature ({st:.0f}°C) is accelerating moisture loss."
             elif sm < 15:
                 extra = " Moisture is critically low — crops may already be stressed."
@@ -1206,7 +1299,7 @@ def build_recommendation(
 
     if pest == "high":
         extra = ""
-        if sensor and sensor.get("humidity", 0) > 70:
+        if sensor and sensor.get("humidity", 0) > HUMIDITY_NORMAL_HIGH:
             extra = " High humidity is creating ideal conditions for pest spread."
         parts.append(f"🐛 High pest risk detected.{extra} Apply preventive treatment and inspect crops closely.")
     elif pest == "medium":
@@ -1229,18 +1322,31 @@ def health():
     sms_mode = "not_configured"
     if AT_USERNAME and AT_API_KEY:
         sms_mode = "sandbox" if AT_USERNAME.lower() == "sandbox" else "live"
+    elapsed = time.time() - _server_start_time
+    grace_remaining = max(0, int(STARTUP_GRACE_SECONDS - elapsed))
     return {
-        "status":          "ok",
-        "version":         "9.3.0",
-        "models_loaded":   list(_state["models"].keys()),
-        "is_training":     _state["meta"]["is_training"],
-        "sms_mode":        sms_mode,
-        "at_username":     AT_USERNAME or "NOT SET",
-        "pest_profiles":   len(VIBRATION_PROFILES),
-        "vib_watcher":     f"polling every {VIBRATION_POLL_INTERVAL}s",
-        "rec_watcher":     f"polling every {AI_REC_POLL_INTERVAL}s",
-        "sensor_watcher":  f"polling every {SENSOR_POLL_INTERVAL}s",
-        "hourly_watcher":  f"sampling every 60s, flushing hourly",
+        "status":           "ok",
+        "version":          "9.4.0",
+        "models_loaded":    list(_state["models"].keys()),
+        "is_training":      _state["meta"]["is_training"],
+        "sms_mode":         sms_mode,
+        "at_username":      AT_USERNAME or "NOT SET",
+        "pest_profiles":    len(VIBRATION_PROFILES),
+        "vib_watcher":      f"polling every {VIBRATION_POLL_INTERVAL}s",
+        "rec_watcher":      f"polling every {AI_REC_POLL_INTERVAL}s",
+        "sensor_watcher":   f"polling every {SENSOR_POLL_INTERVAL}s",
+        "hourly_watcher":   "sampling every 60s, flushing hourly",
+        "startup_grace_s":  STARTUP_GRACE_SECONDS,
+        "grace_remaining_s": grace_remaining,
+        "sms_cooldown_s":   SMS_COOLDOWN,
+        "normal_ranges": {
+            "moisture_%":     f"{MOISTURE_NORMAL_LOW}–{MOISTURE_NORMAL_HIGH}",
+            "soil_temp_c":    f"{SOIL_TEMP_NORMAL_LOW}–{SOIL_TEMP_NORMAL_HIGH}",
+            "air_temp_c":     f"{AIR_TEMP_NORMAL_LOW}–{AIR_TEMP_NORMAL_HIGH}",
+            "humidity_%":     f"0–{HUMIDITY_NORMAL_HIGH}",
+            "rainfall_mm":    f">={RAINFALL_LOW}",
+            "pest_score":     f"<{PEST_SCORE_MEDIUM}",
+        },
     }
 
 
@@ -1288,18 +1394,19 @@ def predict(data: SensorInput, background_tasks: BackgroundTasks):
     sensor_dict    = data.model_dump()
     recommendation = build_recommendation(bool(irr_c), pest_label, planting_label, sensor_dict)
 
-    firebase_set(
-        "soil_monitoring_system/aiRecommendation",
-        {
-            "text":              recommendation,
-            "timestamp":         datetime.utcnow().isoformat() + "Z",
-            "irrigation_needed": bool(irr_c),
-            "pest_risk":         pest_label,
-            "planting_window":   planting_label,
-        }
-    )
-
-    background_tasks.add_task(auto_send_sms_to_farmers)
+    # Only write to Firebase and trigger SMS when thresholds are crossed
+    if _conditions_warrant_sms(bool(irr_c), pest_label, planting_label, sensor_dict):
+        firebase_set(
+            "soil_monitoring_system/aiRecommendation",
+            {
+                "text":              recommendation,
+                "timestamp":         datetime.utcnow().isoformat() + "Z",
+                "irrigation_needed": bool(irr_c),
+                "pest_risk":         pest_label,
+                "planting_window":   planting_label,
+            }
+        )
+        background_tasks.add_task(auto_send_sms_to_farmers)
 
     return PredictionResponse(
         irrigationNeeded=bool(irr_c),
@@ -1529,6 +1636,49 @@ def pest_profiles():
         }
         for p in VIBRATION_PROFILES
     ]
+
+
+@app.get("/normal-ranges")
+def normal_ranges():
+    """
+    Returns the exact thresholds your code uses to decide
+    what is 'normal' vs 'alert' for each sensor reading.
+    """
+    return {
+        "soil_moisture_%": {
+            "normal":  f"{MOISTURE_NORMAL_LOW}–{MOISTURE_NORMAL_HIGH}",
+            "alert_low":  f"< {MOISTURE_NORMAL_LOW} AND rainfall < {RAINFALL_LOW} mm → irrigation SMS",
+            "alert_high": f"> {MOISTURE_NORMAL_HIGH} → waterlogging risk (logged only)",
+        },
+        "soil_temperature_c": {
+            "normal":     f"{SOIL_TEMP_NORMAL_LOW}–{SOIL_TEMP_NORMAL_HIGH}",
+            "pest_bonus": f"> 25°C adds 0.15 to pest score",
+        },
+        "air_temperature_c": {
+            "normal":     f"{AIR_TEMP_NORMAL_LOW}–{AIR_TEMP_NORMAL_HIGH}",
+            "pest_bonus": f"> {AIR_TEMP_NORMAL_HIGH}°C adds 0.10 to pest score",
+        },
+        "humidity_%": {
+            "normal":     f"0–{HUMIDITY_NORMAL_HIGH}",
+            "pest_bonus": f"> {HUMIDITY_NORMAL_HIGH}% adds 0.25 to pest score",
+        },
+        "rainfall_mm_per_day": {
+            "normal":    f">= {RAINFALL_LOW}",
+            "alert":     f"< {RAINFALL_LOW} mm combined with low moisture → irrigation SMS",
+        },
+        "pest_presence_flag": {
+            "normal": "0 (no pest detected)",
+            "alert":  "1 (pest detected) — adds 0.50 to pest score",
+        },
+        "pest_score_composite": {
+            "formula":  "pest×0.50 + humidity>70×0.25 + soil_temp>25×0.15 + air_temp>28×0.10",
+            "low":      f"< {PEST_SCORE_MEDIUM} — normal, no SMS",
+            "medium":   f"{PEST_SCORE_MEDIUM}–{PEST_SCORE_HIGH} — moderate risk SMS",
+            "high":     f">= {PEST_SCORE_HIGH} — high risk SMS",
+        },
+        "sms_cooldown_seconds": SMS_COOLDOWN,
+        "startup_grace_seconds": STARTUP_GRACE_SECONDS,
+    }
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
